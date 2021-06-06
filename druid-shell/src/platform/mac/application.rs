@@ -32,6 +32,7 @@ use crate::application::AppHandler;
 
 use super::clipboard::Clipboard;
 use super::error::Error;
+use super::menu::Menu;
 use super::util;
 
 static APP_HANDLER_IVAR: &str = "druidAppHandler";
@@ -97,7 +98,7 @@ impl Application {
                 }
             }
         } else {
-            log::warn!("Application state already borrowed");
+            tracing::warn!("Application state already borrowed");
         }
     }
 
@@ -114,6 +115,12 @@ impl Application {
             let workspace = class!(NSWorkspace);
             let shared: id = msg_send![workspace, sharedWorkspace];
             let () = msg_send![shared, hideOtherApplications];
+        }
+    }
+
+    pub fn set_menu(&self, menu: Menu) {
+        unsafe {
+            NSApp().setMainMenu_(menu.menu);
         }
     }
 

@@ -14,7 +14,7 @@
 
 //! File open/save dialogs, macOS implementation.
 
-#![allow(non_upper_case_globals)]
+#![allow(non_upper_case_globals, clippy::clippy::upper_case_acronyms)]
 
 use std::ffi::OsString;
 
@@ -121,7 +121,7 @@ pub(crate) unsafe fn build_panel(ty: FileDialogType, mut options: FileDialogOpti
                 }
             }
             if !present {
-                log::warn!("The default type {:?} is not present in allowed types.", dt);
+                tracing::warn!("The default type {:?} is not present in allowed types.", dt);
             }
         }
 

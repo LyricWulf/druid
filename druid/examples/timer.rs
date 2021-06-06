@@ -120,7 +120,7 @@ impl Widget<u32> for SimpleBox {
 }
 
 pub fn main() {
-    let window = WindowDesc::new(|| TimerWidget {
+    let window = WindowDesc::new(TimerWidget {
         timer_id: TimerToken::INVALID,
         simple_box: WidgetPod::new(SimpleBox),
         pos: Point::ZERO,
@@ -129,7 +129,7 @@ pub fn main() {
     .title(LocalizedString::new("timer-demo-window-title").with_placeholder("Look at it go!"));
 
     AppLauncher::with_window(window)
-        .use_simple_logger()
+        .log_to_console()
         .launch(0u32)
         .expect("launch failed");
 }

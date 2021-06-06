@@ -153,9 +153,9 @@ impl Widget<String> for CustomWidget {
 }
 
 pub fn main() {
-    let window = WindowDesc::new(|| CustomWidget {}).title(LocalizedString::new("Fancy Colors"));
+    let window = WindowDesc::new(CustomWidget {}).title(LocalizedString::new("Fancy Colors"));
     AppLauncher::with_window(window)
-        .use_simple_logger()
+        .log_to_console()
         .launch("Druid + Piet".to_string())
         .expect("launch failed");
 }

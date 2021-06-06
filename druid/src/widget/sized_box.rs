@@ -15,6 +15,7 @@
 //! A widget with predefined size.
 
 use std::f64::INFINITY;
+use tracing::{instrument, trace, warn};
 
 use crate::widget::prelude::*;
 use crate::Data;
@@ -22,8 +23,8 @@ use crate::Data;
 /// A widget with predefined size.
 ///
 /// If given a child, this widget forces its child to have a specific width and/or height
-/// (assuming values are permitted by this widget's parent). If either the width or height is not set,
-/// this widget will size itself to match the child's size in that dimension.
+/// (assuming values are permitted by this widget's parent). If either the width or height is not
+/// set, this widget will size itself to match the child's size in that dimension.
 ///
 /// If not given a child, SizedBox will try to size itself as close to the specified height
 /// and width as possible given the parent's constraints. If height or width is not set,
@@ -45,6 +46,11 @@ impl<T> SizedBox<T> {
     }
 
     /// Construct container without child, and both width and height not set.
+    ///
+    /// If the widget is unchanged, it will do nothing, which can be useful if you want to draw a
+    /// widget some of the time (for example, it is used to implement
+    /// [`Maybe`][crate::widget::Maybe]).
+    #[doc(alias = "null")]
     pub fn empty() -> Self {
         Self {
             inner: None,
@@ -127,24 +133,32 @@ impl<T> SizedBox<T> {
 }
 
 impl<T: Data> Widget<T> for SizedBox<T> {
+    #[instrument(name = "SizedBox", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
         if let Some(ref mut inner) = self.inner {
             inner.event(ctx, event, data, env);
         }
     }
 
+    #[instrument(name = "SizedBox", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(&mut self, ctx: &mut LifeCycleCtx, event: &LifeCycle, data: &T, env: &Env) {
         if let Some(ref mut inner) = self.inner {
             inner.lifecycle(ctx, event, data, env)
         }
     }
 
+    #[instrument(
+        name = "SizedBox",
+        level = "trace",
+        skip(self, ctx, old_data, data, env)
+    )]
     fn update(&mut self, ctx: &mut UpdateCtx, old_data: &T, data: &T, env: &Env) {
         if let Some(ref mut inner) = self.inner {
             inner.update(ctx, old_data, data, env);
         }
     }
 
+    #[instrument(name = "SizedBox", level = "trace", skip(self, ctx, bc, data, env))]
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
         bc.debug_check("SizedBox");
 
@@ -154,17 +168,19 @@ impl<T: Data> Widget<T> for SizedBox<T> {
             None => bc.constrain((self.width.unwrap_or(0.0), self.height.unwrap_or(0.0))),
         };
 
+        trace!("Computed size: {}", size);
         if size.width.is_infinite() {
-            log::warn!("SizedBox is returning an infinite width.");
+            warn!("SizedBox is returning an infinite width.");
         }
 
         if size.height.is_infinite() {
-            log::warn!("SizedBox is returning an infinite height.");
+            warn!("SizedBox is returning an infinite height.");
         }
 
         size
     }
 
+    #[instrument(name = "SizedBox", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
         if let Some(ref mut inner) = self.inner {
             inner.paint(ctx, data, env);
@@ -186,6 +202,7 @@ impl<T: Data> Widget<T> for SizedBox<T> {
 mod tests {
     use super::*;
     use crate::widget::Label;
+    use test_env_log::test;
 
     #[test]
     fn expand() {

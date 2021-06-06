@@ -16,7 +16,7 @@
 
 use std::any;
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -75,7 +75,7 @@ struct EnvImpl {
 /// }
 ///
 /// fn main() {
-///     let main_window = WindowDesc::new(important_label);
+///     let main_window = WindowDesc::new(important_label());
 ///
 ///     AppLauncher::with_window(main_window)
 ///         .configure_env(|env, _state| {
@@ -87,7 +87,7 @@ struct EnvImpl {
 ///
 /// [`ValueType`]: trait.ValueType.html
 /// [`Env`]: struct.Env.html
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Data)]
 pub struct Key<T> {
     key: &'static str,
     value_type: PhantomData<T>,
@@ -132,6 +132,16 @@ pub enum KeyOrValue<T> {
     /// [`Key<T>`]: struct.Key.html
     /// [`Env`]: struct.Env.html
     Key(Key<T>),
+}
+
+impl<T: Data> Data for KeyOrValue<T> {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Concrete(a), Self::Concrete(b)) => a.same(b),
+            (Self::Key(a), Self::Key(b)) => a.same(b),
+            _ => false,
+        }
+    }
 }
 
 /// A trait for anything that can resolve a value of some type from the [`Env`].
@@ -332,13 +342,18 @@ impl Env {
     ) -> Result<(), ValueTypeError> {
         let env = Arc::make_mut(&mut self.0);
         let key = key.into();
-        // TODO: use of Entry might be more efficient
-        if let Some(existing) = env.map.get(&key) {
-            if !existing.is_same_type(&raw) {
-                return Err(ValueTypeError::new(any::type_name::<V>(), raw));
+        match env.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                let existing = e.get_mut();
+                if !existing.is_same_type(&raw) {
+                    return Err(ValueTypeError::new(any::type_name::<V>(), raw));
+                }
+                *existing = raw;
+            }
+            Entry::Vacant(e) => {
+                e.insert(raw);
             }
         }
-        env.map.insert(key, raw);
         Ok(())
     }
 
@@ -420,7 +435,7 @@ impl Value {
         use Value::*;
         matches!(
             (self, other),
-            (Point(_) , Point(_))
+            (Point(_), Point(_))
                 | (Size(_), Size(_))
                 | (Rect(_), Rect(_))
                 | (Insets(_), Insets(_))
@@ -564,9 +579,9 @@ macro_rules! impl_value_type {
             }
         }
 
-        impl Into<Value> for $ty {
-            fn into(self) -> Value {
-                Value::$var(self)
+        impl From<$ty> for Value {
+            fn from(val: $ty) -> Value {
+                Value::$var(val)
             }
         }
     };
@@ -608,9 +623,28 @@ impl<T: ValueType> From<Key<T>> for KeyOrValue<T> {
     }
 }
 
+impl From<f64> for KeyOrValue<Insets> {
+    fn from(src: f64) -> KeyOrValue<Insets> {
+        KeyOrValue::Concrete(src.into())
+    }
+}
+
+impl From<(f64, f64)> for KeyOrValue<Insets> {
+    fn from(src: (f64, f64)) -> KeyOrValue<Insets> {
+        KeyOrValue::Concrete(src.into())
+    }
+}
+
+impl From<(f64, f64, f64, f64)> for KeyOrValue<Insets> {
+    fn from(src: (f64, f64, f64, f64)) -> KeyOrValue<Insets> {
+        KeyOrValue::Concrete(src.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_env_log::test;
 
     #[test]
     fn string_key_or_value() {

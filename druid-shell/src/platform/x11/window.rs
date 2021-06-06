@@ -14,8 +14,7 @@
 
 //! X11 window creation and window management.
 
-use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BinaryHeap;
 use std::convert::{TryFrom, TryInto};
 use std::os::unix::io::RawFd;
@@ -24,18 +23,23 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::scale::Scalable;
 use anyhow::{anyhow, Context, Error};
 use cairo::{XCBConnection as CairoXCBConnection, XCBDrawable, XCBSurface, XCBVisualType};
+use tracing::{error, info, warn};
 use x11rb::atom_manager;
 use x11rb::connection::Connection;
 use x11rb::protocol::present::{CompleteNotifyEvent, ConnectionExt as _, IdleNotifyEvent};
 use x11rb::protocol::xfixes::{ConnectionExt as _, Region as XRegion};
 use x11rb::protocol::xproto::{
-    self, AtomEnum, ConfigureNotifyEvent, ConnectionExt, CreateGCAux, EventMask, Gcontext, Pixmap,
-    PropMode, Rectangle, Visualtype, WindowClass,
+    self, AtomEnum, ChangeWindowAttributesAux, ConfigureNotifyEvent, ConnectionExt, CreateGCAux,
+    EventMask, Gcontext, Pixmap, PropMode, Rectangle, Visualtype, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::xcb_ffi::XCBConnection;
+
+#[cfg(feature = "raw-win-handle")]
+use raw_window_handle::{unix::XcbHandle, HasRawWindowHandle, RawWindowHandle};
 
 use crate::common_util::IdleCallback;
 use crate::dialog::FileDialogOptions;
@@ -46,8 +50,11 @@ use crate::mouse::{Cursor, CursorDesc, MouseButton, MouseButtons, MouseEvent};
 use crate::piet::{Piet, PietText, RenderContext};
 use crate::region::Region;
 use crate::scale::Scale;
-use crate::window;
-use crate::window::{FileDialogToken, IdleToken, TimerToken, WinHandler, WindowLevel};
+use crate::text::{simulate_input, Event};
+use crate::window::{
+    FileDialogToken, IdleToken, TextFieldToken, TimerToken, WinHandler, WindowLevel,
+};
+use crate::{window, ScaledArea};
 
 use super::application::Application;
 use super::keycodes;
@@ -94,6 +101,9 @@ pub(crate) struct WindowBuilder {
     handler: Option<Box<dyn WinHandler>>,
     title: String,
     size: Size,
+
+    // TODO: implement min_size for X11
+    #[allow(dead_code)]
     min_size: Size,
 }
 
@@ -117,28 +127,32 @@ impl WindowBuilder {
     }
 
     pub fn set_min_size(&mut self, min_size: Size) {
-        log::warn!("WindowBuilder::set_min_size is implemented, but the setting is currently unused for X11 platforms.");
+        warn!("WindowBuilder::set_min_size is implemented, but the setting is currently unused for X11 platforms.");
         self.min_size = min_size;
     }
 
     pub fn resizable(&mut self, _resizable: bool) {
-        log::warn!("WindowBuilder::resizable is currently unimplemented for X11 platforms.");
+        warn!("WindowBuilder::resizable is currently unimplemented for X11 platforms.");
     }
 
     pub fn show_titlebar(&mut self, _show_titlebar: bool) {
-        log::warn!("WindowBuilder::show_titlebar is currently unimplemented for X11 platforms.");
+        warn!("WindowBuilder::show_titlebar is currently unimplemented for X11 platforms.");
+    }
+
+    pub fn set_transparent(&mut self, _transparent: bool) {
+        // Ignored
     }
 
     pub fn set_position(&mut self, _position: Point) {
-        log::warn!("WindowBuilder::set_position is currently unimplemented for X11 platforms.");
+        warn!("WindowBuilder::set_position is currently unimplemented for X11 platforms.");
     }
 
     pub fn set_level(&mut self, _level: window::WindowLevel) {
-        log::warn!("WindowBuilder::set_level  is currently unimplemented for X11 platforms.");
+        warn!("WindowBuilder::set_level  is currently unimplemented for X11 platforms.");
     }
 
     pub fn set_window_state(&self, _state: window::WindowState) {
-        log::warn!("WindowBuilder::set_window_state is currently unimplemented for X11 platforms.");
+        warn!("WindowBuilder::set_window_state is currently unimplemented for X11 platforms.");
     }
 
     pub fn set_title<S: Into<String>>(&mut self, title: S) {
@@ -206,6 +220,28 @@ impl WindowBuilder {
         let screen_num = self.app.screen_num();
         let id = conn.generate_id()?;
         let setup = conn.setup();
+
+        let env_dpi = std::env::var("DRUID_X11_DPI")
+            .ok()
+            .map(|x| x.parse::<f64>());
+
+        let scale = match env_dpi.or_else(|| self.app.rdb.get_value("Xft.dpi", "").transpose()) {
+            Some(Ok(dpi)) => {
+                let scale = dpi / 96.;
+                Scale::new(scale, scale)
+            }
+            None => Scale::default(),
+            Some(Err(err)) => {
+                let default = Scale::default();
+                warn!(
+                    "Unable to parse dpi: {:?}, defaulting to {:?}",
+                    err, default
+                );
+                default
+            }
+        };
+
+        let size_px = self.size.to_px(scale);
         let screen = setup
             .roots
             .get(screen_num as usize)
@@ -225,7 +261,7 @@ impl WindowBuilder {
         );
 
         // Create the actual window
-        let (width, height) = (self.size.width as u16, self.size.height as u16);
+        let (width_px, height_px) = (size_px.width as u16, size_px.height as u16);
         conn.create_window(
             // Window depth
             x11rb::COPY_FROM_PARENT.try_into().unwrap(),
@@ -239,11 +275,9 @@ impl WindowBuilder {
             // Y-coordinate of the new window
             0,
             // Width of the new window
-            // TODO(x11/dpi_scaling): figure out DPI scaling
-            width,
+            width_px,
             // Height of the new window
-            // TODO(x11/dpi_scaling): figure out DPI scaling
-            height,
+            height_px,
             // Border width
             0,
             // Window class type
@@ -266,15 +300,10 @@ impl WindowBuilder {
         // TODO(x11/errors): Should do proper cleanup (window destruction etc) in case of error
         let atoms = self.atoms(id)?;
         let cairo_surface = RefCell::new(self.create_cairo_surface(id, &visual_type)?);
-        let state = RefCell::new(WindowState {
-            size: self.size,
-            invalid: Region::EMPTY,
-            destroyed: false,
-        });
         let present_data = match self.initialize_present_data(id) {
             Ok(p) => Some(p),
             Err(e) => {
-                log::info!("Failed to initialize present extension: {}", e);
+                info!("Failed to initialize present extension: {}", e);
                 None
             }
         };
@@ -287,8 +316,8 @@ impl WindowBuilder {
             conn,
             id,
             buf_count,
-            width,
-            height,
+            width_px,
+            height_px,
             screen.root_depth,
         )?);
 
@@ -313,12 +342,16 @@ impl WindowBuilder {
             handler,
             cairo_surface,
             atoms,
-            state,
+            area: Cell::new(ScaledArea::from_px(size_px, scale)),
+            scale: Cell::new(scale),
+            invalid: RefCell::new(Region::EMPTY),
+            destroyed: Cell::new(false),
             timer_queue: Mutex::new(BinaryHeap::new()),
             idle_queue: Arc::new(Mutex::new(Vec::new())),
             idle_pipe: self.app.idle_pipe(),
             present_data: RefCell::new(present_data),
             buffers,
+            active_text_field: Cell::new(None),
         });
         window.set_title(&self.title);
 
@@ -388,7 +421,12 @@ pub(crate) struct Window {
     handler: RefCell<Box<dyn WinHandler>>,
     cairo_surface: RefCell<XCBSurface>,
     atoms: WindowAtoms,
-    state: RefCell<WindowState>,
+    area: Cell<ScaledArea>,
+    scale: Cell<Scale>,
+    /// We've told X11 to destroy this window, so don't so any more X requests with this window id.
+    destroyed: Cell<bool>,
+    /// The region that was invalidated since the last time we rendered.
+    invalid: RefCell<Region>,
     /// Timers, sorted by "earliest deadline first"
     timer_queue: Mutex<BinaryHeap<Timer>>,
     idle_queue: Arc<Mutex<Vec<IdleKind>>>,
@@ -426,6 +464,7 @@ pub(crate) struct Window {
     /// actually been presented.
     present_data: RefCell<Option<PresentData>>,
     buffers: RefCell<Buffers>,
+    active_text_field: Cell<Option<TextFieldToken>>,
 }
 
 // This creates a `struct WindowAtoms` containing the specified atoms as members (along with some
@@ -471,15 +510,6 @@ atom_manager! {
         _NET_WM_NAME,
         UTF8_STRING,
     }
-}
-
-/// The mutable state of the window.
-struct WindowState {
-    size: Size,
-    /// The region that was invalidated since the last time we rendered.
-    invalid: Region,
-    /// We've told X11 to destroy this window, so don't so any more X requests with this window id.
-    destroyed: bool,
 }
 
 /// A collection of pixmaps for rendering to. This gets used in two different ways: if the present
@@ -543,11 +573,11 @@ impl Window {
     #[track_caller]
     fn with_handler<T, F: FnOnce(&mut dyn WinHandler) -> T>(&self, f: F) -> Option<T> {
         if self.cairo_surface.try_borrow_mut().is_err()
-            || self.state.try_borrow_mut().is_err()
+            || self.invalid.try_borrow_mut().is_err()
             || self.present_data.try_borrow_mut().is_err()
             || self.buffers.try_borrow_mut().is_err()
         {
-            log::error!("other RefCells were borrowed when calling into the handler");
+            error!("other RefCells were borrowed when calling into the handler");
             return None;
         }
 
@@ -562,17 +592,18 @@ impl Window {
         match self.handler.try_borrow_mut() {
             Ok(mut h) => Some(f(&mut **h)),
             Err(_) => {
-                log::error!("failed to borrow WinHandler at {}", Location::caller());
+                error!("failed to borrow WinHandler at {}", Location::caller());
                 None
             }
         }
     }
 
     fn connect(&self, handle: WindowHandle) -> Result<(), Error> {
-        let size = self.size()?;
+        let size = self.size().size_dp();
+        let scale = self.scale.get();
         self.with_handler(|h| {
             h.connect(&handle.into());
-            h.scale(Scale::default());
+            h.scale(scale);
             h.size(size);
         });
         Ok(())
@@ -581,28 +612,25 @@ impl Window {
     /// Start the destruction of the window.
     pub fn destroy(&self) {
         if !self.destroyed() {
-            match borrow_mut!(self.state) {
-                Ok(mut state) => state.destroyed = true,
-                Err(e) => log::error!("Failed to set destroyed flag: {}", e),
-            }
+            self.destroyed.set(true);
             log_x11!(self.app.connection().destroy_window(self.id));
         }
     }
 
     fn destroyed(&self) -> bool {
-        borrow!(self.state).map(|s| s.destroyed).unwrap_or(false)
+        self.destroyed.get()
     }
 
-    fn size(&self) -> Result<Size, Error> {
-        Ok(borrow!(self.state)?.size)
+    fn size(&self) -> ScaledArea {
+        self.area.get()
     }
 
+    // note: size is in px
     fn set_size(&self, size: Size) -> Result<(), Error> {
-        // TODO(x11/dpi_scaling): detect DPI and scale size
+        let scale = self.scale.get();
         let new_size = {
-            let mut state = borrow_mut!(self.state)?;
-            if size != state.size {
-                state.size = size;
+            if size != self.area.get().size_px() {
+                self.area.set(ScaledArea::from_px(size, scale));
                 true
             } else {
                 false
@@ -624,8 +652,9 @@ impl Window {
                         status
                     )
                 })?;
-            self.add_invalid_rect(size.to_rect())?;
-            self.with_handler(|h| h.size(size));
+            self.add_invalid_rect(size.to_dp(scale).to_rect())?;
+            self.with_handler(|h| h.size(size.to_dp(scale)));
+            self.with_handler(|h| h.scale(scale));
         }
         Ok(())
     }
@@ -636,7 +665,7 @@ impl Window {
         let pixmap = if let Some(p) = buffers.idle_pixmaps.last() {
             *p
         } else {
-            log::info!("ran out of idle pixmaps, creating a new one");
+            info!("ran out of idle pixmaps, creating a new one");
             buffers.create_pixmap(self.app.connection(), self.id)?
         };
 
@@ -655,16 +684,17 @@ impl Window {
         }
 
         self.update_cairo_surface()?;
-        let invalid = std::mem::replace(&mut borrow_mut!(self.state)?.invalid, Region::EMPTY);
+        let invalid = std::mem::replace(&mut *borrow_mut!(self.invalid)?, Region::EMPTY);
         {
             let surface = borrow!(self.cairo_surface)?;
             let cairo_ctx = cairo::Context::new(&surface);
-
+            let scale = self.scale.get();
             for rect in invalid.rects() {
+                let rect = rect.to_px(scale);
                 cairo_ctx.rectangle(rect.x0, rect.y0, rect.width(), rect.height());
             }
             cairo_ctx.clip();
-
+            cairo_ctx.scale(scale.x(), scale.y());
             let mut piet_ctx = Piet::new(&cairo_ctx);
 
             // We need to be careful with earlier returns here, because piet_ctx
@@ -704,13 +734,15 @@ impl Window {
             .idle_pixmaps
             .last()
             .ok_or_else(|| anyhow!("after rendering, no pixmap to present"))?;
+        let scale = self.scale.get();
         if let Some(present) = borrow_mut!(self.present_data)?.as_mut() {
-            present.present(self.app.connection(), pixmap, self.id, &invalid)?;
+            present.present(self.app.connection(), pixmap, self.id, &invalid, scale)?;
             buffers.idle_pixmaps.pop();
         } else {
-            for r in invalid.rects() {
-                let (x, y) = (r.x0 as i16, r.y0 as i16);
-                let (w, h) = (r.width() as u16, r.height() as u16);
+            for rect in invalid.rects() {
+                let rect = rect.to_px(scale).expand();
+                let (x, y) = (rect.x0 as i16, rect.y0 as i16);
+                let (w, h) = (rect.width() as u16, rect.height() as u16);
                 self.app
                     .connection()
                     .copy_area(pixmap, self.id, self.gc, x, y, x, y, w, h)?;
@@ -731,12 +763,12 @@ impl Window {
 
     /// Set whether the window should be resizable
     fn resizable(&self, _resizable: bool) {
-        log::warn!("Window::resizeable is currently unimplemented for X11 platforms.");
+        warn!("Window::resizeable is currently unimplemented for X11 platforms.");
     }
 
     /// Set whether the window should show titlebar
     fn show_titlebar(&self, _show_titlebar: bool) {
-        log::warn!("Window::show_titlebar is currently unimplemented for X11 platforms.");
+        warn!("Window::show_titlebar is currently unimplemented for X11 platforms.");
     }
 
     /// Bring this window to the front of the window stack and give it focus.
@@ -759,7 +791,8 @@ impl Window {
     }
 
     fn add_invalid_rect(&self, rect: Rect) -> Result<(), Error> {
-        borrow_mut!(self.state)?.invalid.add_rect(rect.expand());
+        // expanding not needed here, because we are expanding at every use of invalid
+        borrow_mut!(self.invalid)?.add_rect(rect);
         Ok(())
     }
 
@@ -781,7 +814,7 @@ impl Window {
     fn request_anim_frame(&self) {
         if let Ok(true) = self.waiting_on_present() {
             if let Err(e) = self.set_needs_present(true) {
-                log::error!(
+                error!(
                     "Window::request_anim_frame - failed to schedule present: {}",
                     e
                 );
@@ -796,15 +829,16 @@ impl Window {
     }
 
     fn invalidate(&self) {
-        match self.size() {
-            Ok(size) => self.invalidate_rect(size.to_rect()),
-            Err(err) => log::error!("Window::invalidate - failed to get size: {}", err),
-        }
+        let rect = self.size().size_dp().to_rect();
+        self.add_invalid_rect(rect)
+            .unwrap_or_else(|err| error!("Window::invalidate - failed to invalidate: {}", err));
+
+        self.request_anim_frame();
     }
 
     fn invalidate_rect(&self, rect: Rect) {
         if let Err(err) = self.add_invalid_rect(rect) {
-            log::error!("Window::invalidate_rect - failed to enlarge rect: {}", err);
+            error!("Window::invalidate_rect - failed to enlarge rect: {}", err);
         }
 
         self.request_anim_frame();
@@ -834,22 +868,49 @@ impl Window {
         ));
     }
 
+    fn set_cursor(&self, cursor: &Cursor) {
+        let cursors = &self.app.cursors;
+        #[allow(deprecated)]
+        let cursor = match cursor {
+            Cursor::Arrow => cursors.default,
+            Cursor::IBeam => cursors.text,
+            Cursor::Pointer => cursors.pointer,
+            Cursor::Crosshair => cursors.crosshair,
+            Cursor::OpenHand => {
+                warn!("Cursor::OpenHand not supported for x11 backend. using arrow cursor");
+                None
+            }
+            Cursor::NotAllowed => cursors.not_allowed,
+            Cursor::ResizeLeftRight => cursors.col_resize,
+            Cursor::ResizeUpDown => cursors.row_resize,
+            // TODO: (x11/custom cursor)
+            Cursor::Custom(_) => None,
+        };
+        if cursor.is_none() {
+            warn!("Unable to load cursor {:?}", cursor);
+            return;
+        }
+        let conn = self.app.connection();
+        let changes = ChangeWindowAttributesAux::new().cursor(cursor);
+        if let Err(e) = conn.change_window_attributes(self.id, &changes) {
+            error!("Changing cursor window attribute failed {}", e);
+        };
+    }
+
     fn set_menu(&self, _menu: Menu) {
         // TODO(x11/menus): implement Window::set_menu (currently a no-op)
     }
 
     fn get_scale(&self) -> Result<Scale, Error> {
-        // TODO(x11/dpi_scaling): figure out DPI scaling
-        Ok(Scale::new(1.0, 1.0))
+        Ok(self.scale.get())
     }
 
     pub fn handle_expose(&self, expose: &xproto::ExposeEvent) -> Result<(), Error> {
-        // TODO(x11/dpi_scaling): when dpi scaling is
-        // implemented, it needs to be used here too
         let rect = Rect::from_origin_size(
             (expose.x as f64, expose.y as f64),
             (expose.width as f64, expose.height as f64),
-        );
+        )
+        .to_dp(self.scale.get());
 
         self.add_invalid_rect(rect)?;
         if self.waiting_on_present()? {
@@ -876,13 +937,21 @@ impl Window {
             repeat: false,
             is_composing: false,
         };
-        self.with_handler(|h| h.key_down(key_event));
+        self.with_handler(|h| {
+            if !h.key_down(key_event.clone()) {
+                simulate_input(h, self.active_text_field.get(), key_event);
+            }
+        });
     }
 
-    pub fn handle_button_press(&self, button_press: &xproto::ButtonPressEvent) {
+    pub fn handle_button_press(
+        &self,
+        button_press: &xproto::ButtonPressEvent,
+    ) -> Result<(), Error> {
         let button = mouse_button(button_press.detail);
+        let scale = self.scale.get();
         let mouse_event = MouseEvent {
-            pos: Point::new(button_press.event_x as f64, button_press.event_y as f64),
+            pos: Point::new(button_press.event_x as f64, button_press.event_y as f64).to_dp(scale),
             // The xcb state field doesn't include the newly pressed button, but
             // druid wants it to be included.
             buttons: mouse_buttons(button_press.state).with(button),
@@ -894,12 +963,18 @@ impl Window {
             wheel_delta: Vec2::ZERO,
         };
         self.with_handler(|h| h.mouse_down(&mouse_event));
+        Ok(())
     }
 
-    pub fn handle_button_release(&self, button_release: &xproto::ButtonReleaseEvent) {
+    pub fn handle_button_release(
+        &self,
+        button_release: &xproto::ButtonReleaseEvent,
+    ) -> Result<(), Error> {
+        let scale = self.scale.get();
         let button = mouse_button(button_release.detail);
         let mouse_event = MouseEvent {
-            pos: Point::new(button_release.event_x as f64, button_release.event_y as f64),
+            pos: Point::new(button_release.event_x as f64, button_release.event_y as f64)
+                .to_dp(scale),
             // The xcb state includes the newly released button, but druid
             // doesn't want it.
             buttons: mouse_buttons(button_release.state).without(button),
@@ -910,11 +985,13 @@ impl Window {
             wheel_delta: Vec2::ZERO,
         };
         self.with_handler(|h| h.mouse_up(&mouse_event));
+        Ok(())
     }
 
     pub fn handle_wheel(&self, event: &xproto::ButtonPressEvent) -> Result<(), Error> {
         let button = event.detail;
         let mods = key_mods(event.state);
+        let scale = self.scale.get();
 
         // We use a delta of 120 per tick to match the behavior of Windows.
         let is_shift = mods.shift();
@@ -928,7 +1005,7 @@ impl Window {
             _ => return Err(anyhow!("unexpected mouse wheel button: {}", button)),
         };
         let mouse_event = MouseEvent {
-            pos: Point::new(event.event_x as f64, event.event_y as f64),
+            pos: Point::new(event.event_x as f64, event.event_y as f64).to_dp(scale),
             buttons: mouse_buttons(event.state),
             mods: key_mods(event.state),
             count: 0,
@@ -941,9 +1018,14 @@ impl Window {
         Ok(())
     }
 
-    pub fn handle_motion_notify(&self, motion_notify: &xproto::MotionNotifyEvent) {
+    pub fn handle_motion_notify(
+        &self,
+        motion_notify: &xproto::MotionNotifyEvent,
+    ) -> Result<(), Error> {
+        let scale = self.scale.get();
         let mouse_event = MouseEvent {
-            pos: Point::new(motion_notify.event_x as f64, motion_notify.event_y as f64),
+            pos: Point::new(motion_notify.event_x as f64, motion_notify.event_y as f64)
+                .to_dp(scale),
             buttons: mouse_buttons(motion_notify.state),
             mods: key_mods(motion_notify.state),
             count: 0,
@@ -952,6 +1034,7 @@ impl Window {
             wheel_delta: Vec2::ZERO,
         };
         self.with_handler(|h| h.mouse_move(&mouse_event));
+        Ok(())
     }
 
     pub fn handle_client_message(&self, client_message: &xproto::ClientMessageEvent) {
@@ -980,23 +1063,22 @@ impl Window {
             // one present request in flight, so we should only get notified about the request
             // that we're waiting for.
             if present.waiting_on != Some(event.serial) {
-                log::warn!(
+                warn!(
                     "Got a notify for serial {}, but waiting on {:?}",
-                    event.serial,
-                    present.waiting_on
+                    event.serial, present.waiting_on
                 );
             }
 
             // Check whether we missed presenting on any frames.
             if let Some(last_msc) = present.last_msc {
                 if last_msc.wrapping_add(1) != event.msc {
-                    log::debug!(
+                    tracing::debug!(
                         "missed a present: msc went from {} to {}",
                         last_msc,
                         event.msc
                     );
                     if let Some(last_ust) = present.last_ust {
-                        log::debug!("ust went from {} to {}", last_ust, event.ust);
+                        tracing::debug!("ust went from {} to {}", last_ust, event.ust);
                     }
                 }
             }
@@ -1064,7 +1146,7 @@ impl Window {
             for callback in queue {
                 match callback {
                     IdleKind::Callback(f) => {
-                        f.call(handler.as_any());
+                        f.call(handler);
                     }
                     IdleKind::Token(tok) => {
                         handler.idle(tok);
@@ -1078,17 +1160,17 @@ impl Window {
 
         if needs_redraw {
             if let Err(e) = self.redraw_now() {
-                log::error!("Error redrawing: {}", e);
+                error!("Error redrawing: {}", e);
             }
         }
     }
 
     pub(crate) fn next_timeout(&self) -> Option<Instant> {
-        if let Some(timer) = self.timer_queue.lock().unwrap().peek() {
-            Some(timer.deadline())
-        } else {
-            None
-        }
+        self.timer_queue
+            .lock()
+            .unwrap()
+            .peek()
+            .map(|timer| timer.deadline())
     }
 
     pub(crate) fn run_timers(&self, now: Instant) {
@@ -1192,15 +1274,19 @@ impl PresentData {
         pixmap: Pixmap,
         window_id: u32,
         region: &Region,
+        scale: Scale,
     ) -> Result<(), Error> {
         let x_rects: Vec<Rectangle> = region
             .rects()
             .iter()
-            .map(|r| Rectangle {
-                x: r.x0 as i16,
-                y: r.y0 as i16,
-                width: r.width() as u16,
-                height: r.height() as u16,
+            .map(|r| {
+                let r = r.to_px(scale).expand();
+                Rectangle {
+                    x: r.x0 as i16,
+                    y: r.y0 as i16,
+                    width: r.width() as u16,
+                    height: r.height() as u16,
+                }
             })
             .collect();
 
@@ -1251,7 +1337,7 @@ fn mouse_button(button: u8) -> MouseButton {
         8 => MouseButton::X1,
         9 => MouseButton::X2,
         _ => {
-            log::warn!("unknown mouse button code {}", button);
+            warn!("unknown mouse button code {}", button);
             MouseButton::None
         }
     }
@@ -1320,7 +1406,7 @@ impl IdleHandle {
                 Err(nix::Error::Sys(nix::errno::Errno::EINTR)) => {}
                 Err(nix::Error::Sys(nix::errno::Errno::EAGAIN)) => {}
                 Err(e) => {
-                    log::error!("Failed to write to idle pipe: {}", e);
+                    error!("Failed to write to idle pipe: {}", e);
                     break;
                 }
                 Ok(_) => {
@@ -1337,7 +1423,7 @@ impl IdleHandle {
 
     pub fn add_idle_callback<F>(&self, callback: F)
     where
-        F: FnOnce(&dyn Any) + Send + 'static,
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
         self.queue
             .lock()
@@ -1367,7 +1453,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.show();
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1375,7 +1461,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.close();
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1383,7 +1469,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.resizable(resizable);
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1391,55 +1477,55 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.show_titlebar(show_titlebar);
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
     pub fn set_position(&self, _position: Point) {
-        log::warn!("WindowHandle::set_position is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::set_position is currently unimplemented for X11 platforms.");
     }
 
     pub fn get_position(&self) -> Point {
-        log::warn!("WindowHandle::get_position is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::get_position is currently unimplemented for X11 platforms.");
         Point::new(0.0, 0.0)
     }
 
     pub fn content_insets(&self) -> Insets {
-        log::warn!("WindowHandle::content_insets unimplemented for X11 platforms.");
+        warn!("WindowHandle::content_insets unimplemented for X11 platforms.");
         Insets::ZERO
     }
 
     pub fn set_level(&self, _level: WindowLevel) {
-        log::warn!("WindowHandle::set_level  is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::set_level  is currently unimplemented for X11 platforms.");
     }
 
     pub fn set_size(&self, _size: Size) {
-        log::warn!("WindowHandle::set_size is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::set_size is currently unimplemented for X11 platforms.");
     }
 
     pub fn get_size(&self) -> Size {
-        log::warn!("WindowHandle::get_size is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::get_size is currently unimplemented for X11 platforms.");
         Size::new(0.0, 0.0)
     }
 
     pub fn set_window_state(&self, _state: window::WindowState) {
-        log::warn!("WindowHandle::set_window_state is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::set_window_state is currently unimplemented for X11 platforms.");
     }
 
     pub fn get_window_state(&self) -> window::WindowState {
-        log::warn!("WindowHandle::get_window_state is currently unimplemented for X11 platforms.");
-        window::WindowState::RESTORED
+        warn!("WindowHandle::get_window_state is currently unimplemented for X11 platforms.");
+        window::WindowState::Restored
     }
 
     pub fn handle_titlebar(&self, _val: bool) {
-        log::warn!("WindowHandle::handle_titlebar is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::handle_titlebar is currently unimplemented for X11 platforms.");
     }
 
     pub fn bring_to_front_and_focus(&self) {
         if let Some(w) = self.window.upgrade() {
             w.bring_to_front_and_focus();
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1447,7 +1533,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.request_anim_frame();
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1455,7 +1541,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.invalidate();
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1463,7 +1549,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.invalidate_rect(rect);
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1471,7 +1557,7 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.set_title(title);
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
@@ -1479,12 +1565,34 @@ impl WindowHandle {
         if let Some(w) = self.window.upgrade() {
             w.set_menu(menu);
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
         }
     }
 
     pub fn text(&self) -> PietText {
         PietText::new()
+    }
+
+    pub fn add_text_field(&self) -> TextFieldToken {
+        TextFieldToken::next()
+    }
+
+    pub fn remove_text_field(&self, token: TextFieldToken) {
+        if let Some(window) = self.window.upgrade() {
+            if window.active_text_field.get() == Some(token) {
+                window.active_text_field.set(None)
+            }
+        }
+    }
+
+    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
+        if let Some(window) = self.window.upgrade() {
+            window.active_text_field.set(active_field);
+        }
+    }
+
+    pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
+        // noop until we get a real text input implementation
     }
 
     pub fn request_timer(&self, deadline: Instant) -> TimerToken {
@@ -1497,49 +1605,67 @@ impl WindowHandle {
         }
     }
 
-    pub fn set_cursor(&mut self, _cursor: &Cursor) {
-        // TODO(x11/cursors): implement WindowHandle::set_cursor
+    pub fn set_cursor(&mut self, cursor: &Cursor) {
+        if let Some(w) = self.window.upgrade() {
+            w.set_cursor(cursor);
+        }
     }
 
     pub fn make_cursor(&self, _cursor_desc: &CursorDesc) -> Option<Cursor> {
-        log::warn!("Custom cursors are not yet supported in the X11 backend");
+        warn!("Custom cursors are not yet supported in the X11 backend");
         None
     }
 
     pub fn open_file(&mut self, _options: FileDialogOptions) -> Option<FileDialogToken> {
         // TODO(x11/file_dialogs): implement WindowHandle::open_file
-        log::warn!("WindowHandle::open_file is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::open_file is currently unimplemented for X11 platforms.");
         None
     }
 
     pub fn save_as(&mut self, _options: FileDialogOptions) -> Option<FileDialogToken> {
         // TODO(x11/file_dialogs): implement WindowHandle::save_as
-        log::warn!("WindowHandle::save_as is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::save_as is currently unimplemented for X11 platforms.");
         None
     }
 
     pub fn show_context_menu(&self, _menu: Menu, _pos: Point) {
         // TODO(x11/menus): implement WindowHandle::show_context_menu
-        log::warn!("WindowHandle::show_context_menu is currently unimplemented for X11 platforms.");
+        warn!("WindowHandle::show_context_menu is currently unimplemented for X11 platforms.");
     }
 
     pub fn get_idle_handle(&self) -> Option<IdleHandle> {
-        if let Some(w) = self.window.upgrade() {
-            Some(IdleHandle {
-                queue: Arc::clone(&w.idle_queue),
-                pipe: w.idle_pipe,
-            })
-        } else {
-            None
-        }
+        self.window.upgrade().map(|w| IdleHandle {
+            queue: Arc::clone(&w.idle_queue),
+            pipe: w.idle_pipe,
+        })
     }
 
     pub fn get_scale(&self) -> Result<Scale, ShellError> {
         if let Some(w) = self.window.upgrade() {
             Ok(w.get_scale()?)
         } else {
-            log::error!("Window {} has already been dropped", self.id);
+            error!("Window {} has already been dropped", self.id);
             Ok(Scale::new(1.0, 1.0))
         }
+    }
+}
+
+#[cfg(feature = "raw-win-handle")]
+unsafe impl HasRawWindowHandle for WindowHandle {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        let mut handle = XcbHandle {
+            window: self.id,
+            ..XcbHandle::empty()
+        };
+
+        if let Some(window) = self.window.upgrade() {
+            handle.connection = window.app.connection().get_raw_xcb_connection();
+        } else {
+            // Documentation for HasRawWindowHandle encourages filling in all fields possible,
+            // leaving those empty that cannot be derived.
+            error!("Failed to get XCBConnection, returning incomplete handle");
+        }
+
+        RawWindowHandle::Xcb(handle)
     }
 }

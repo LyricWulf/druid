@@ -24,6 +24,8 @@ use crate::widget::prelude::*;
 use crate::widget::WidgetWrapper;
 use crate::{Data, Lens};
 
+use tracing::{instrument, trace};
+
 /// A wrapper for its widget subtree to have access to a part
 /// of its parent's data.
 ///
@@ -67,6 +69,16 @@ impl<T, U, L, W> LensWrap<T, U, L, W> {
             phantom_t: Default::default(),
         }
     }
+
+    /// Get a reference to the lens.
+    pub fn lens(&self) -> &L {
+        &self.lens
+    }
+
+    /// Get a mutable reference to the lens.
+    pub fn lens_mut(&mut self) -> &mut L {
+        &mut self.lens
+    }
 }
 
 impl<T, U, L, W> Widget<T> for LensWrap<T, U, L, W>
@@ -76,18 +88,25 @@ where
     L: Lens<T, U>,
     W: Widget<U>,
 {
+    #[instrument(name = "LensWrap", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut T, env: &Env) {
         let inner = &mut self.inner;
         self.lens
             .with_mut(data, |data| inner.event(ctx, event, data, env))
     }
 
+    #[instrument(name = "LensWrap", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(&mut self, ctx: &mut LifeCycleCtx, event: &LifeCycle, data: &T, env: &Env) {
         let inner = &mut self.inner;
         self.lens
             .with(data, |data| inner.lifecycle(ctx, event, data, env))
     }
 
+    #[instrument(
+        name = "LensWrap",
+        level = "trace",
+        skip(self, ctx, old_data, data, env)
+    )]
     fn update(&mut self, ctx: &mut UpdateCtx, old_data: &T, data: &T, env: &Env) {
         let inner = &mut self.inner;
         let lens = &self.lens;
@@ -95,17 +114,21 @@ where
             lens.with(data, |data| {
                 if ctx.has_requested_update() || !old_data.same(data) || ctx.env_changed() {
                     inner.update(ctx, old_data, data, env);
+                } else {
+                    trace!("skipping child update");
                 }
             })
         })
     }
 
+    #[instrument(name = "LensWrap", level = "trace", skip(self, ctx, bc, data, env))]
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints, data: &T, env: &Env) -> Size {
         let inner = &mut self.inner;
         self.lens
             .with(data, |data| inner.layout(ctx, bc, data, env))
     }
 
+    #[instrument(name = "LensWrap", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
         let inner = &mut self.inner;
         self.lens.with(data, |data| inner.paint(ctx, data, env));
