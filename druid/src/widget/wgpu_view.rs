@@ -26,7 +26,7 @@
 use crate::widget::prelude::*;
 use crate::{Data, NativeWindowHandle};
 
-use log::{debug, info};
+use tracing::{debug, info};
 
 /// A trait for rendering custom content into a `WgpuView` by accessing its internal wgpu pipeline.
 pub trait WgpuRenderer {

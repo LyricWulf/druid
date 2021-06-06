@@ -16,7 +16,6 @@
 
 #![allow(non_snake_case, clippy::cast_lossless)]
 
-use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::mem;
 use std::panic::Location;
@@ -25,8 +24,8 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use log::{debug, error, warn};
 use scopeguard::defer;
+use tracing::{debug, error, warn};
 use winapi::ctypes::{c_int, c_void};
 use winapi::shared::dxgi::*;
 use winapi::shared::dxgi1_2::*;
@@ -35,6 +34,7 @@ use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::*;
+use winapi::um::dcomp::{IDCompositionDevice, IDCompositionTarget, IDCompositionVisual};
 use winapi::um::dwmapi::DwmExtendFrameIntoClientArea;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::shellscalingapi::MDT_EFFECTIVE_DPI;
@@ -43,6 +43,11 @@ use winapi::um::uxtheme::*;
 use winapi::um::wingdi::*;
 use winapi::um::winnt::*;
 use winapi::um::winuser::*;
+use winapi::Interface;
+use wio::com::ComPtr;
+
+#[cfg(feature = "raw-win-handle")]
+use raw_window_handle::{windows::WindowsHandle, HasRawWindowHandle, RawWindowHandle};
 
 use piet_common::d2d::{D2DFactory, DeviceContext};
 use piet_common::dwrite::DwriteFactory;
@@ -68,8 +73,11 @@ use crate::keyboard::{KbKey, KeyState};
 use crate::mouse::{Cursor, CursorDesc, MouseButton, MouseButtons, MouseEvent};
 use crate::region::Region;
 use crate::scale::{Scalable, Scale, ScaledArea};
+use crate::text::{simulate_input, Event};
 use crate::window;
-use crate::window::{FileDialogToken, IdleToken, TimerToken, WinHandler, WindowLevel};
+use crate::window::{
+    FileDialogToken, IdleToken, TextFieldToken, TimerToken, WinHandler, WindowLevel,
+};
 
 /// The platform target DPI.
 ///
@@ -86,8 +94,10 @@ pub(crate) struct WindowBuilder {
     resizable: bool,
     show_titlebar: bool,
     size: Option<Size>,
+    transparent: bool,
     min_size: Option<Size>,
     position: Option<Point>,
+    level: Option<WindowLevel>,
     state: window::WindowState,
     parent: Option<WindowRef>,
 }
@@ -96,6 +106,7 @@ pub(crate) struct WindowBuilder {
 /// It's very tricky to get smooth dynamics (especially resizing) and
 /// good performance on Windows. This setting lets clients experiment
 /// with different strategies.
+#[allow(dead_code)]
 pub enum PresentStrategy {
     /// Corresponds to the swap effect DXGI_SWAP_EFFECT_SEQUENTIAL. It
     /// is compatible with GDI (such as menus), but is not the best in
@@ -155,8 +166,28 @@ enum DeferredOp {
 
 #[derive(Clone)]
 pub struct WindowHandle {
-    dwrite_factory: DwriteFactory,
+    text: PietText,
     state: Weak<WindowState>,
+}
+
+#[cfg(feature = "raw-win-handle")]
+unsafe impl HasRawWindowHandle for WindowHandle {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        if let Some(hwnd) = self.get_hwnd() {
+            let handle = WindowsHandle {
+                hwnd: hwnd as *mut core::ffi::c_void,
+                hinstance: unsafe {
+                    winapi::um::libloaderapi::GetModuleHandleW(0 as winapi::um::winnt::LPCWSTR)
+                        as *mut core::ffi::c_void
+                },
+                ..WindowsHandle::empty()
+            };
+            RawWindowHandle::Windows(handle)
+        } else {
+            error!("Cannot retrieved HWND for window.");
+            RawWindowHandle::Windows(WindowsHandle::empty())
+        }
+    }
 }
 
 /// A handle that can get used to schedule an idle handler. Note that
@@ -195,9 +226,14 @@ struct WindowState {
     timers: Arc<Mutex<TimerSlots>>,
     deferred_queue: RefCell<Vec<DeferredOp>>,
     has_titlebar: Cell<bool>,
+    is_transparent: Cell<bool>,
     // For resizable borders, window can still be resized with code.
     is_resizable: Cell<bool>,
     handle_titlebar: Cell<bool>,
+    active_text_input: Cell<Option<TextFieldToken>>,
+    // Is the window focusable ("activatable" in Win32 terminology)?
+    // False for tooltips, to prevent stealing focus from owner window.
+    is_focusable: bool,
 }
 
 /// Generic handler trait for the winapi window procedure entry point.
@@ -216,7 +252,7 @@ struct MyWndProc {
     app: Application,
     handle: RefCell<WindowHandle>,
     d2d_factory: D2DFactory,
-    dwrite_factory: DwriteFactory,
+    text: PietText,
     state: RefCell<Option<WndState>>,
     present_strategy: PresentStrategy,
 }
@@ -232,6 +268,7 @@ struct WndState {
     // capture. When the first mouse button is down on our window we enter
     // capture, and we hold it until the last mouse button is up.
     captured_mouse_buttons: MouseButtons,
+    transparent: bool,
     // Is this window the topmost window under the mouse cursor
     has_mouse_focus: bool,
     //TODO: track surrogate orphan
@@ -243,6 +280,14 @@ struct WndState {
 /// State for DXGI swapchains.
 struct DxgiState {
     swap_chain: *mut IDXGISwapChain1,
+
+    // These ComPtrs must live as long as the window
+    #[allow(dead_code)]
+    composition_device: Option<ComPtr<IDCompositionDevice>>,
+    #[allow(dead_code)]
+    composition_target: Option<ComPtr<IDCompositionTarget>>,
+    #[allow(dead_code)]
+    composition_visual: Option<ComPtr<IDCompositionVisual>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -348,7 +393,7 @@ fn set_style(hwnd: HWND, resizable: bool, titlebar: bool) {
         } else {
             style |= WS_MINIMIZEBOX | WS_SYSMENU | WS_OVERLAPPED;
         }
-        if SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize) == 0 {
+        if SetWindowLongPtrW(hwnd, GWL_STYLE, style as _) == 0 {
             warn!(
                 "failed to set the window style: {}",
                 Error::Hr(HRESULT_FROM_WIN32(GetLastError()))
@@ -361,7 +406,13 @@ fn set_style(hwnd: HWND, resizable: bool, titlebar: bool) {
             0,
             0,
             0,
-            SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOSIZE,
+            SWP_SHOWWINDOW
+                | SWP_NOMOVE
+                | SWP_NOZORDER
+                | SWP_FRAMECHANGED
+                | SWP_NOSIZE
+                | SWP_NOOWNERZORDER
+                | SWP_NOACTIVATE,
         ) == 0
         {
             warn!(
@@ -376,7 +427,7 @@ impl WndState {
     fn rebuild_render_target(&mut self, d2d: &D2DFactory, scale: Scale) -> Result<(), Error> {
         unsafe {
             let swap_chain = self.dxgi_state.as_ref().unwrap().swap_chain;
-            match paint::create_render_target_dxgi(d2d, swap_chain, scale) {
+            match paint::create_render_target_dxgi(d2d, swap_chain, scale, self.transparent) {
                 Ok(rt) => {
                     self.render_target =
                         Some(rt.as_device_context().expect("TODO remove this expect"));
@@ -388,11 +439,13 @@ impl WndState {
     }
 
     // Renders but does not present.
-    fn render(&mut self, d2d: &D2DFactory, dw: &DwriteFactory, invalid: &Region) {
+    fn render(&mut self, d2d: &D2DFactory, text: &PietText, invalid: &Region) {
         let rt = self.render_target.as_mut().unwrap();
+
         rt.begin_draw();
         {
-            let mut piet_ctx = Piet::new(d2d, dw.clone(), rt);
+            let mut piet_ctx = Piet::new(d2d, text.clone(), rt);
+
             // The documentation on DXGI_PRESENT_PARAMETERS says we "must not update any
             // pixel outside of the dirty rectangles."
             piet_ctx.clip(invalid.to_bez_path());
@@ -450,13 +503,9 @@ impl MyWndProc {
         F: FnOnce(&mut WndState) -> R,
     {
         let ret = if let Ok(mut s) = self.state.try_borrow_mut() {
-            if let Some(state) = &mut *s {
-                Some(f(state))
-            } else {
-                None
-            }
+            (*s).as_mut().map(|state| f(state))
         } else {
-            log::error!("failed to borrow WndState at {}", Location::caller());
+            error!("failed to borrow WndState at {}", Location::caller());
             None
         };
         if ret.is_some() {
@@ -500,6 +549,10 @@ impl MyWndProc {
         self.with_window_state(|state| state.is_resizable.get())
     }
 
+    fn is_transparent(&self) -> bool {
+        self.with_window_state(|state| state.is_transparent.get())
+    }
+
     fn handle_deferred_queue(&self) {
         let q = self.with_window_state(move |state| state.deferred_queue.replace(Vec::new()));
         for op in q {
@@ -510,15 +563,16 @@ impl MyWndProc {
     fn handle_deferred(&self, op: DeferredOp) {
         if let Some(hwnd) = self.handle.borrow().get_hwnd() {
             match op {
-                DeferredOp::SetSize(size) => unsafe {
+                DeferredOp::SetSize(size_dp) => unsafe {
+                    let size_px = size_dp.to_px(self.scale());
                     if SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
                         0,
                         0,
-                        (size.width * self.scale().x()) as i32,
-                        (size.height * self.scale().y()) as i32,
-                        SWP_NOMOVE | SWP_NOZORDER,
+                        size_px.width.round() as i32,
+                        size_px.height.round() as i32,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
                     ) == 0
                     {
                         warn!(
@@ -527,15 +581,16 @@ impl MyWndProc {
                         );
                     };
                 },
-                DeferredOp::SetPosition(position) => unsafe {
+                DeferredOp::SetPosition(pos_dp) => unsafe {
+                    let pos_px = pos_dp.to_px(self.scale());
                     if SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
-                        position.x as i32,
-                        position.y as i32,
+                        pos_px.x.round() as i32,
+                        pos_px.y.round() as i32,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOZORDER,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
                     ) == 0
                     {
                         warn!(
@@ -552,14 +607,20 @@ impl MyWndProc {
                     self.with_window_state(|s| s.is_resizable.set(resizable));
                     set_style(hwnd, resizable, self.has_titlebar());
                 }
-                DeferredOp::SetWindowState(val) => unsafe {
-                    let s = match val {
-                        window::WindowState::MAXIMIZED => SW_MAXIMIZE,
-                        window::WindowState::MINIMIZED => SW_MINIMIZE,
-                        window::WindowState::RESTORED => SW_RESTORE,
+                DeferredOp::SetWindowState(val) => {
+                    let show = if self.handle.borrow().is_focusable() {
+                        match val {
+                            window::WindowState::Maximized => SW_MAXIMIZE,
+                            window::WindowState::Minimized => SW_MINIMIZE,
+                            window::WindowState::Restored => SW_RESTORE,
+                        }
+                    } else {
+                        SW_SHOWNOACTIVATE
                     };
-                    ShowWindow(hwnd, s);
-                },
+                    unsafe {
+                        ShowWindow(hwnd, show);
+                    }
+                }
                 DeferredOp::SaveAs(options, token) => {
                     let info = unsafe {
                         get_file_dialog_path(hwnd, FileDialogType::Save, options)
@@ -674,36 +735,44 @@ impl WndProc for MyWndProc {
                 } else {
                     // Native top-level window
 
-                    // Only supported on Windows 10, Could remove this as the 8.1 version below also works on 10.
-                    let scale_factor = if let Some(func) = OPTIONAL_FUNCTIONS.GetDpiForWindow {
-                        unsafe { func(hwnd) as f64 / SCALE_TARGET_DPI }
+                    if let Some(state) = self.handle.borrow().state.upgrade() {
+                        state.hwnd.set(hwnd);
                     }
-                    // Windows 8.1 Support
-                    else if let Some(func) = OPTIONAL_FUNCTIONS.GetDpiForMonitor {
-                        unsafe {
-                            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                            let mut dpiX = 0;
-                            let mut dpiY = 0;
-                            func(monitor, MDT_EFFECTIVE_DPI, &mut dpiX, &mut dpiY);
-                            dpiX as f64 / SCALE_TARGET_DPI
-                        }
-                    } else {
-                        1.0
-                    };
-                    let scale = Scale::new(scale_factor, scale_factor);
-                    self.set_scale(scale);
-
                     if let Some(state) = self.state.borrow_mut().as_mut() {
-                        let dxgi_state = unsafe {
-                            create_dxgi_state(self.present_strategy, hwnd).unwrap_or_else(|e| {
-                                error!("Creating swapchain failed: {:?}", e);
-                                None
-                            })
+                        state.dxgi_state = unsafe {
+                            create_dxgi_state(self.present_strategy, hwnd, self.is_transparent())
+                                .unwrap_or_else(|e| {
+                                    error!("Creating swapchain failed: {:?}", e);
+                                    None
+                                })
                         };
-                        state.dxgi_state = dxgi_state;
+
+                        // Only supported on Windows 10, Could remove this as the 8.1 version below also works on 10.
+                        let scale_factor = if let Some(func) = OPTIONAL_FUNCTIONS.GetDpiForWindow {
+                            unsafe { func(hwnd) as f64 / SCALE_TARGET_DPI }
+                        }
+                        // Windows 8.1 Support
+                        else if let Some(func) = OPTIONAL_FUNCTIONS.GetDpiForMonitor {
+                            unsafe {
+                                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                                let mut dpiX = 0;
+                                let mut dpiY = 0;
+                                func(monitor, MDT_EFFECTIVE_DPI, &mut dpiX, &mut dpiY);
+                                dpiX as f64 / SCALE_TARGET_DPI
+                            }
+                        } else {
+                            1.0
+                        };
+
+                        let scale = Scale::new(scale_factor, scale_factor);
+                        self.set_scale(scale);
 
                         let handle = self.handle.borrow().to_owned();
                         state.handler.connect(&handle.into());
+
+                        if let Err(e) = state.rebuild_render_target(&self.d2d_factory, scale) {
+                            error!("error building render target: {}", e);
+                        }
                     }
                 }
                 Some(0)
@@ -711,7 +780,7 @@ impl WndProc for MyWndProc {
             WM_ACTIVATE => {
                 if LOWORD(wparam as u32) as u32 != 0 {
                     unsafe {
-                        if !self.has_titlebar() {
+                        if !self.has_titlebar() && !self.is_transparent() {
                             // This makes windows paint the dropshadow around the window
                             // since we give it a "1 pixel frame" that we paint over anyway.
                             // From my testing top seems to be the best option when it comes to avoiding resize artifacts.
@@ -734,7 +803,9 @@ impl WndProc for MyWndProc {
                                 | SWP_NOMOVE
                                 | SWP_NOZORDER
                                 | SWP_FRAMECHANGED
-                                | SWP_NOSIZE,
+                                | SWP_NOSIZE
+                                | SWP_NOOWNERZORDER
+                                | SWP_NOACTIVATE,
                         ) == 0
                         {
                             warn!(
@@ -774,7 +845,7 @@ impl WndProc for MyWndProc {
                         s.handler.rebuild_resources();
                         if s.render_target.is_some() {
                             // Native top-level window with DXGI/D2D paint pipeline
-                            s.render(&self.d2d_factory, &self.dwrite_factory, &invalid);
+                            s.render(&self.d2d_factory, &self.text, &invalid);
                             if let Some(ref mut ds) = s.dxgi_state {
                                 let mut dirty_rects =
                                     util::region_to_rectis(&invalid, self.scale());
@@ -805,14 +876,18 @@ impl WndProc for MyWndProc {
                     (*rect).top,
                     (*rect).right - (*rect).left,
                     (*rect).bottom - (*rect).top,
-                    SWP_NOZORDER | SWP_FRAMECHANGED | SWP_DRAWFRAME,
+                    SWP_NOZORDER
+                        | SWP_FRAMECHANGED
+                        | SWP_DRAWFRAME
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOACTIVATE,
                 );
                 Some(0)
             },
             WM_NCCALCSIZE => unsafe {
                 if wparam != 0 && !self.has_titlebar() {
                     if let Ok(handle) = self.handle.try_borrow() {
-                        if handle.get_window_state() == window::WindowState::MAXIMIZED {
+                        if handle.get_window_state() == window::WindowState::Maximized {
                             // When maximized, windows still adds offsets for the frame
                             // so we counteract them here.
                             let s: *mut NCCALCSIZE_PARAMS = lparam as *mut NCCALCSIZE_PARAMS;
@@ -834,7 +909,7 @@ impl WndProc for MyWndProc {
                 let mut hit = DefWindowProcW(hwnd, msg, wparam, lparam);
                 if !self.has_titlebar() && self.resizable() {
                     if let Ok(handle) = self.handle.try_borrow() {
-                        if handle.get_window_state() != window::WindowState::MAXIMIZED {
+                        if handle.get_window_state() != window::WindowState::Maximized {
                             let mut rect = RECT {
                                 left: 0,
                                 top: 0,
@@ -929,13 +1004,9 @@ impl WndProc for MyWndProc {
                         );
                         if SUCCEEDED(res) {
                             if let Err(e) = s.rebuild_render_target(&self.d2d_factory, scale) {
-                                log::error!("error building render target: {}", e);
+                                error!("error building render target: {}", e);
                             }
-                            s.render(
-                                &self.d2d_factory,
-                                &self.dwrite_factory,
-                                &size_dp.to_rect().into(),
-                            );
+                            s.render(&self.d2d_factory, &self.text, &size_dp.to_rect().into());
                             let present_after = match self.present_strategy {
                                 PresentStrategy::Sequential => 1,
                                 _ => 0,
@@ -948,6 +1019,7 @@ impl WndProc for MyWndProc {
                             error!("ResizeBuffers failed: 0x{:x}", res);
                         }
                     }
+
                     s.post_render();
                 })
                 .map(|_| 0)
@@ -971,7 +1043,14 @@ impl WndProc for MyWndProc {
                                 && (event.key == KbKey::Alt || event.key == KbKey::F10);
                             match event.state {
                                 KeyState::Down => {
-                                    if s.handler.key_down(event) || handle_menu {
+                                    let keydown_handled = self.with_window_state(|window_state| {
+                                        simulate_input(
+                                            &mut *s.handler,
+                                            window_state.active_text_input.get(),
+                                            event,
+                                        )
+                                    });
+                                    if keydown_handled || handle_menu {
                                         return true;
                                     }
                                 }
@@ -1013,7 +1092,7 @@ impl WndProc for MyWndProc {
                     };
                     unsafe {
                         if ScreenToClient(hwnd, &mut p) == FALSE {
-                            log::warn!(
+                            warn!(
                                 "ScreenToClient failed: {}",
                                 Error::Hr(HRESULT_FROM_WIN32(GetLastError()))
                             );
@@ -1109,7 +1188,7 @@ impl WndProc for MyWndProc {
                             XBUTTON2 => Some(MouseButton::X2),
                             w => {
                                 // Should never happen with current Windows
-                                log::warn!("Received an unknown XBUTTON event ({})", w);
+                                warn!("Received an unknown XBUTTON event ({})", w);
                                 None
                             }
                         }
@@ -1206,10 +1285,9 @@ impl WndProc for MyWndProc {
                 let min_max_info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
                 self.with_wnd_state(|s| {
                     if let Some(min_size_dp) = s.min_size {
-                        let min_area = ScaledArea::from_dp(min_size_dp, self.scale());
-                        let min_size_px = min_area.size_px();
-                        min_max_info.ptMinTrackSize.x = min_size_px.width as i32;
-                        min_max_info.ptMinTrackSize.y = min_size_px.height as i32;
+                        let min_size_px = min_size_dp.to_px(self.scale());
+                        min_max_info.ptMinTrackSize.x = min_size_px.width.round() as i32;
+                        min_max_info.ptMinTrackSize.y = min_size_px.height.round() as i32;
                     }
                 });
                 Some(0)
@@ -1219,7 +1297,7 @@ impl WndProc for MyWndProc {
                     let queue = self.handle.borrow().take_idle_queue();
                     for callback in queue {
                         match callback {
-                            IdleKind::Callback(it) => it.call(s.handler.as_any()),
+                            IdleKind::Callback(it) => it.call(&mut *s.handler),
                             IdleKind::Token(token) => s.handler.idle(token),
                         }
                     }
@@ -1239,11 +1317,13 @@ impl WindowBuilder {
             menu: None,
             resizable: true,
             show_titlebar: true,
+            transparent: false,
             present_strategy: Default::default(),
             size: None,
             min_size: None,
             position: None,
-            state: window::WindowState::RESTORED,
+            level: None,
+            state: window::WindowState::Restored,
             parent: None,
         }
     }
@@ -1269,6 +1349,19 @@ impl WindowBuilder {
         self.show_titlebar = show_titlebar;
     }
 
+    pub fn set_transparent(&mut self, transparent: bool) {
+        // Transparency and Flip is only supported on Windows 8 and newer and
+        // require DComposition
+        if transparent {
+            if OPTIONAL_FUNCTIONS.DCompositionCreateDevice.is_some() {
+                self.present_strategy = PresentStrategy::Flip;
+                self.transparent = true;
+            } else {
+                tracing::warn!("Transparency requires Windows 8 or newer");
+            }
+        }
+    }
+
     pub fn set_title<S: Into<String>>(&mut self, title: S) {
         self.title = title.into();
     }
@@ -1285,8 +1378,13 @@ impl WindowBuilder {
         self.state = state;
     }
 
-    pub fn set_level(&mut self, _level: WindowLevel) {
-        log::warn!("WindowBuilder::set_level  is currently unimplemented for Windows platforms.");
+    pub fn set_level(&mut self, level: WindowLevel) {
+        match level {
+            WindowLevel::AppWindow | WindowLevel::Tooltip => self.level = Some(level),
+            _ => {
+                warn!("WindowBuilder::set_level({:?}) is currently unimplemented for Windows platforms.", level);
+            }
+        }
     }
 
     pub fn set_parent(&mut self, parent: &WindowHandle) {
@@ -1299,12 +1397,13 @@ impl WindowBuilder {
         unsafe {
             let class_name = super::util::CLASS_NAME.to_wide();
             let dwrite_factory = DwriteFactory::new().unwrap();
-            let dw_clone = dwrite_factory.clone();
+            let fonts = self.app.fonts.clone();
+            let text = PietText::new_with_shared_fonts(dwrite_factory, Some(fonts));
             let wndproc = MyWndProc {
                 app: self.app.clone(),
                 handle: Default::default(),
                 d2d_factory: D2DFactory::new().unwrap(),
-                dwrite_factory: dw_clone,
+                text: text.clone(),
                 state: RefCell::new(None),
                 present_strategy: self.present_strategy,
             };
@@ -1362,6 +1461,28 @@ impl WindowBuilder {
                 None => (0 as HMENU, None, false),
             };
 
+            let mut dwStyle = WS_OVERLAPPEDWINDOW;
+            let mut dwExStyle: DWORD = 0;
+            let mut focusable = true;
+            if let Some(level) = self.level {
+                match level {
+                    WindowLevel::AppWindow => (),
+                    WindowLevel::Tooltip => {
+                        dwStyle = WS_POPUP;
+                        dwExStyle = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                        focusable = false;
+                    }
+                    WindowLevel::DropDown => {
+                        dwStyle = WS_CHILD;
+                        dwExStyle = 0;
+                    }
+                    WindowLevel::Modal => {
+                        dwStyle = WS_OVERLAPPED;
+                        dwExStyle = WS_EX_TOPMOST;
+                    }
+                }
+            }
+
             let window = WindowState {
                 // 'hwnd' is assigned in window_proc() on WM_CREATE
                 hwnd: Cell::new(0 as HWND),
@@ -1380,11 +1501,14 @@ impl WindowBuilder {
                 deferred_queue: RefCell::new(Vec::new()),
                 has_titlebar: Cell::new(self.show_titlebar),
                 is_resizable: Cell::new(self.resizable),
+                is_transparent: Cell::new(self.transparent),
                 handle_titlebar: Cell::new(false),
+                active_text_input: Cell::new(None),
+                is_focusable: focusable,
             };
             let win = Rc::new(window);
             let handle = WindowHandle {
-                dwrite_factory,
+                text,
                 state: Rc::downgrade(&win),
             };
 
@@ -1396,6 +1520,7 @@ impl WindowBuilder {
                 keyboard_state: KeyboardState::new(),
                 captured_mouse_buttons: MouseButtons::new(),
                 has_mouse_focus: false,
+                transparent: self.transparent,
                 last_click_time: Instant::now(),
                 last_click_pos: (0, 0),
                 click_count: 0,
@@ -1413,15 +1538,15 @@ impl WindowBuilder {
             if !self.show_titlebar || has_parent {
                 dwStyle &= !(WS_MINIMIZEBOX | WS_SYSMENU | WS_OVERLAPPED);
             }
-            let mut dwExStyle = 0;
+
             if self.present_strategy == PresentStrategy::Flip {
                 dwExStyle |= WS_EX_NOREDIRECTIONBITMAP;
             }
 
             if !has_parent {
                 match self.state {
-                    window::WindowState::MAXIMIZED => dwStyle |= WS_MAXIMIZE,
-                    window::WindowState::MINIMIZED => dwStyle |= WS_MINIMIZE,
+                    window::WindowState::Maximized => dwStyle |= WS_MAXIMIZE,
+                    window::WindowState::Minimized => dwStyle |= WS_MINIMIZE,
                     _ => (),
                 };
             }
@@ -1448,16 +1573,17 @@ impl WindowBuilder {
                 return Err(Error::NullHwnd);
             }
 
-            if let Some(size) = self.size {
+            if let Some(size_dp) = self.size {
                 if let Ok(scale) = handle.get_scale() {
+                    let size_px = size_dp.to_px(scale);
                     if SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
                         0,
                         0,
-                        (size.width * scale.x()) as i32,
-                        (size.height * scale.y()) as i32,
-                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        size_px.width.round() as i32,
+                        size_px.height.round() as i32,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                     ) == 0
                     {
                         warn!(
@@ -1517,6 +1643,7 @@ unsafe fn choose_adapter(factory: *mut IDXGIFactory2) -> *mut IDXGIAdapter {
 unsafe fn create_dxgi_state(
     present_strategy: PresentStrategy,
     hwnd: HWND,
+    transparent: bool,
 ) -> Result<Option<DxgiState>, Error> {
     let mut factory: *mut IDXGIFactory2 = null_mut();
     as_result(CreateDXGIFactory1(
@@ -1535,6 +1662,7 @@ unsafe fn create_dxgi_state(
             (DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 2)
         }
     };
+
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: 1024,
         Height: 768,
@@ -1548,21 +1676,83 @@ unsafe fn create_dxgi_state(
         BufferCount: bufs,
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: swap_effect,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        AlphaMode: if transparent {
+            DXGI_ALPHA_MODE_PREMULTIPLIED
+        } else {
+            DXGI_ALPHA_MODE_IGNORE
+        },
         Flags: 0,
     };
     let mut swap_chain: *mut IDXGISwapChain1 = null_mut();
-    let res = (*factory).CreateSwapChainForHwnd(
-        d3d11_device.raw_ptr() as *mut IUnknown,
-        hwnd,
-        &desc,
-        null_mut(),
-        null_mut(),
-        &mut swap_chain,
+    let swap_chain_res = if transparent {
+        (*factory).CreateSwapChainForComposition(
+            d3d11_device.raw_ptr() as *mut IUnknown,
+            &desc,
+            null_mut(),
+            &mut swap_chain,
+        )
+    } else {
+        (*factory).CreateSwapChainForHwnd(
+            d3d11_device.raw_ptr() as *mut IUnknown,
+            hwnd,
+            &desc,
+            null_mut(),
+            null_mut(),
+            &mut swap_chain,
+        )
+    };
+    debug!(
+        "swap chain res = 0x{:x}, pointer = {:?}",
+        swap_chain_res, swap_chain
     );
-    debug!("swap chain res = 0x{:x}, pointer = {:?}", res, swap_chain);
 
-    Ok(Some(DxgiState { swap_chain }))
+    let (composition_device, composition_target, composition_visual) = if transparent {
+        // This behavior is only supported on windows 8 and newer where
+        // composition is available
+
+        // Following resources are created according to this tutorial:
+        // https://docs.microsoft.com/en-us/archive/msdn-magazine/2014/june/windows-with-c-high-performance-window-layering-using-the-windows-composition-engine
+        let DCompositionCreateDevice = OPTIONAL_FUNCTIONS.DCompositionCreateDevice.unwrap();
+
+        // Create IDCompositionDevice
+        let mut ptr: *mut c_void = null_mut();
+        DCompositionCreateDevice(
+            d3d11_device.raw_ptr() as *mut IDXGIDevice,
+            &IDCompositionDevice::uuidof(),
+            &mut ptr,
+        );
+        let composition_device = ComPtr::<IDCompositionDevice>::from_raw(ptr as _);
+
+        // Create IDCompositionTarget for the window
+        let mut ptr: *mut IDCompositionTarget = null_mut();
+        composition_device.CreateTargetForHwnd(hwnd as _, 1, &mut ptr);
+        let composition_target = ComPtr::from_raw(ptr);
+
+        // Create IDCompositionVisual and assign to swap chain
+        let mut ptr: *mut IDCompositionVisual = null_mut();
+        composition_device.CreateVisual(&mut ptr);
+        let composition_visual = ComPtr::from_raw(ptr);
+        composition_visual.SetContent(swap_chain as *mut IUnknown);
+
+        // Set the root as composition target and commit
+        composition_target.SetRoot(composition_visual.as_raw());
+        composition_device.Commit();
+
+        (
+            Some(composition_device),
+            Some(composition_target),
+            Some(composition_visual),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    Ok(Some(DxgiState {
+        swap_chain,
+        composition_device,
+        composition_target,
+        composition_visual,
+    }))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1636,11 +1826,16 @@ unsafe fn create_window(
 
 impl Cursor {
     fn get_hcursor(&self) -> HCURSOR {
+        #[allow(deprecated)]
         let name = match self {
             Cursor::Arrow => IDC_ARROW,
             Cursor::IBeam => IDC_IBEAM,
+            Cursor::Pointer => IDC_HAND,
             Cursor::Crosshair => IDC_CROSS,
-            Cursor::OpenHand => IDC_HAND,
+            Cursor::OpenHand => {
+                warn!("Cursor::OpenHand not available on windows");
+                IDC_ARROW
+            }
             Cursor::NotAllowed => IDC_NO,
             Cursor::ResizeLeftRight => IDC_SIZEWE,
             Cursor::ResizeUpDown => IDC_SIZENS,
@@ -1656,12 +1851,16 @@ impl WindowHandle {
     pub fn show(&self) {
         if let Some(w) = self.state.upgrade() {
             let hwnd = w.hwnd.get();
-            unsafe {
-                let show = match self.get_window_state() {
-                    window::WindowState::MAXIMIZED => SW_MAXIMIZE,
-                    window::WindowState::MINIMIZED => SW_MINIMIZE,
+            let show = if w.is_focusable {
+                match self.get_window_state() {
+                    window::WindowState::Maximized => SW_MAXIMIZE,
+                    window::WindowState::Minimized => SW_MINIMIZE,
                     _ => SW_SHOWNORMAL,
-                };
+                }
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            unsafe {
                 ShowWindow(hwnd, show);
                 UpdateWindow(hwnd);
             }
@@ -1680,7 +1879,7 @@ impl WindowHandle {
     /// Bring this window to the front of the window stack and give it focus.
     pub fn bring_to_front_and_focus(&self) {
         //FIXME: implementation goes here
-        log::warn!("bring_to_front_and_focus not yet implemented on windows");
+        warn!("bring_to_front_and_focus not yet implemented on windows");
     }
 
     pub fn request_anim_frame(&self) {
@@ -1691,7 +1890,7 @@ impl WindowHandle {
                 // invalidating anything. We do this because we won't know the final invalidated region
                 // until after calling prepare_paint.
                 if RedrawWindow(hwnd, null(), null_mut(), RDW_INTERNALPAINT) == 0 {
-                    log::warn!(
+                    warn!(
                         "RedrawWindow failed: {}",
                         Error::Hr(HRESULT_FROM_WIN32(GetLastError()))
                     );
@@ -1746,7 +1945,7 @@ impl WindowHandle {
 
     // Sets the position of the window in virtual screen coordinates
     pub fn set_position(&self, position: Point) {
-        self.defer(DeferredOp::SetWindowState(window::WindowState::RESTORED));
+        self.defer(DeferredOp::SetWindowState(window::WindowState::Restored));
         self.defer(DeferredOp::SetPosition(position));
     }
 
@@ -1778,7 +1977,32 @@ impl WindowHandle {
     }
 
     pub fn content_insets(&self) -> Insets {
-        log::warn!("WindowHandle::content_insets unimplemented for windows.");
+        if let Some(w) = self.state.upgrade() {
+            let hwnd = w.hwnd.get();
+            unsafe {
+                let mut info: WINDOWINFO = mem::zeroed();
+                info.cbSize = mem::size_of::<WINDOWINFO>() as u32;
+
+                if GetWindowInfo(hwnd, &mut info) == 0 {
+                    warn!(
+                        "failed to get window info: {}",
+                        Error::Hr(HRESULT_FROM_WIN32(GetLastError()))
+                    );
+                };
+
+                let window_frame = Rect::from_points(
+                    (info.rcWindow.left as f64, info.rcWindow.top as f64),
+                    (info.rcWindow.right as f64, info.rcWindow.bottom as f64),
+                );
+                let content_frame = Rect::from_points(
+                    (info.rcClient.left as f64, info.rcClient.top as f64),
+                    (info.rcClient.right as f64, info.rcClient.bottom as f64),
+                );
+
+                return (window_frame - content_frame).to_dp(w.scale.get());
+            }
+        }
+
         Insets::ZERO
     }
 
@@ -1853,15 +2077,15 @@ impl WindowHandle {
                     );
                 }
                 if (style & WS_MAXIMIZE) != 0 {
-                    window::WindowState::MAXIMIZED
+                    window::WindowState::Maximized
                 } else if (style & WS_MINIMIZE) != 0 {
-                    window::WindowState::MINIMIZED
+                    window::WindowState::Minimized
                 } else {
-                    window::WindowState::RESTORED
+                    window::WindowState::Restored
                 }
             }
         } else {
-            window::WindowState::RESTORED
+            window::WindowState::Restored
         }
     }
 
@@ -1897,7 +2121,29 @@ impl WindowHandle {
     }
 
     pub fn text(&self) -> PietText {
-        PietText::new(self.dwrite_factory.clone())
+        self.text.clone()
+    }
+
+    pub fn add_text_field(&self) -> TextFieldToken {
+        TextFieldToken::next()
+    }
+
+    pub fn remove_text_field(&self, token: TextFieldToken) {
+        if let Some(state) = self.state.upgrade() {
+            if state.active_text_input.get() == Some(token) {
+                state.active_text_input.set(None);
+            }
+        }
+    }
+
+    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
+        if let Some(state) = self.state.upgrade() {
+            state.active_text_input.set(active_field);
+        }
+    }
+
+    pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
+        // noop until we get a real text input implementation
     }
 
     /// Request a timer event.
@@ -2007,6 +2253,12 @@ impl WindowHandle {
         self.state.upgrade().map(|w| w.hwnd.get())
     }
 
+    /// Check whether the window can receive keyboard focus. This is generally true,
+    /// except for special windows like tooltips.
+    pub fn is_focusable(&self) -> bool {
+        self.state.upgrade().map(|w| w.is_focusable).unwrap_or(true)
+    }
+
     /// Get a handle that can be used to schedule an idle task.
     pub fn get_idle_handle(&self) -> Option<IdleHandle> {
         self.state.upgrade().map(|w| IdleHandle {
@@ -2063,7 +2315,7 @@ impl IdleHandle {
     /// which means it won't be scheduled if the window is closed.
     pub fn add_idle_callback<F>(&self, callback: F)
     where
-        F: FnOnce(&dyn Any) + Send + 'static,
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
         let mut queue = self.queue.lock().unwrap();
         if queue.is_empty() {
@@ -2089,7 +2341,7 @@ impl Default for WindowHandle {
     fn default() -> Self {
         WindowHandle {
             state: Default::default(),
-            dwrite_factory: DwriteFactory::new().unwrap(),
+            text: PietText::new_with_shared_fonts(DwriteFactory::new().unwrap(), None),
         }
     }
 }

@@ -17,7 +17,7 @@
 //! everything behaves.
 
 use druid::piet::InterpolationMode;
-use druid::text::format::ParseFormatter;
+use druid::text::ParseFormatter;
 use druid::widget::{prelude::*, FillStrat, Image};
 use druid::widget::{
     Checkbox, CrossAxisAlignment, Flex, Label, RadioGroup, SizedBox, TextBox, WidgetExt,
@@ -204,7 +204,7 @@ fn make_ui() -> impl Widget<AppState> {
 }
 
 pub fn main() {
-    let main_window = WindowDesc::new(make_ui)
+    let main_window = WindowDesc::new(make_ui())
         .window_size((650., 450.))
         .title("Flex Container Options");
 
@@ -219,7 +219,7 @@ pub fn main() {
     };
 
     AppLauncher::with_window(main_window)
-        .use_simple_logger()
+        .log_to_console()
         .launch(state)
         .expect("Failed to launch application");
 }

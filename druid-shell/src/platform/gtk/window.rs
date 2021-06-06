@@ -14,7 +14,6 @@
 
 //! GTK window creation and management.
 
-use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::convert::{TryFrom, TryInto};
 use std::ffi::c_void;
@@ -31,6 +30,10 @@ use gdk::{EventKey, EventMask, ModifierType, ScrollDirection, WindowExt, WindowT
 use gio::ApplicationExt;
 use gtk::prelude::*;
 use gtk::{AccelGroup, ApplicationWindow, DrawingArea, SettingsExt};
+use tracing::{error, warn};
+
+#[cfg(feature = "raw-win-handle")]
+use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 
 use crate::kurbo::{Insets, Point, Rect, Size, Vec2};
 use crate::piet::{Piet, PietText, RenderContext};
@@ -43,8 +46,10 @@ use crate::mouse::{Cursor, CursorDesc, MouseButton, MouseButtons, MouseEvent};
 use crate::piet::ImageFormat;
 use crate::region::Region;
 use crate::scale::{Scalable, Scale, ScaledArea};
-use crate::window;
-use crate::window::{FileDialogToken, IdleToken, TimerToken, WinHandler, WindowLevel};
+use crate::text::{simulate_input, Event};
+use crate::window::{
+    self, FileDialogToken, IdleToken, TextFieldToken, TimerToken, WinHandler, WindowLevel,
+};
 
 use super::application::Application;
 use super::dialog;
@@ -94,6 +99,15 @@ pub struct WindowHandle {
     marker: std::marker::PhantomData<*const ()>,
 }
 
+#[cfg(feature = "raw-win-handle")]
+unsafe impl HasRawWindowHandle for WindowHandle {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        error!("HasRawWindowHandle trait not implemented for gtk.");
+        // GTK is not a platform, and there's no empty generic handle. Pick XCB randomly as fallback.
+        RawWindowHandle::Xcb(XcbHandle::empty())
+    }
+}
+
 /// Operations that we defer in order to avoid re-entrancy. See the documentation in the windows
 /// backend for more details.
 enum DeferredOp {
@@ -115,6 +129,7 @@ pub(crate) struct WindowBuilder {
     min_size: Option<Size>,
     resizable: bool,
     show_titlebar: bool,
+    transparent: bool,
 }
 
 #[derive(Clone)]
@@ -136,6 +151,7 @@ pub(crate) struct WindowState {
     window: ApplicationWindow,
     scale: Cell<Scale>,
     area: Cell<ScaledArea>,
+    is_transparent: Cell<bool>,
     /// Used to determine whether to honor close requests from the system: we inhibit them unless
     /// this is true, and this gets set to true when our client requests a close.
     closing: Cell<bool>,
@@ -159,6 +175,7 @@ pub(crate) struct WindowState {
     idle_queue: Arc<Mutex<Vec<IdleKind>>>,
     current_keycode: Cell<Option<u16>>,
     click_counter: ClickCounter,
+    active_text_input: Cell<Option<TextFieldToken>>,
     deferred_queue: RefCell<Vec<DeferredOp>>,
 }
 
@@ -179,6 +196,7 @@ impl WindowBuilder {
             min_size: None,
             resizable: true,
             show_titlebar: true,
+            transparent: false,
         }
     }
 
@@ -200,6 +218,10 @@ impl WindowBuilder {
 
     pub fn show_titlebar(&mut self, show_titlebar: bool) {
         self.show_titlebar = show_titlebar;
+    }
+
+    pub fn set_transparent(&mut self, transparent: bool) {
+        self.transparent = transparent;
     }
 
     pub fn set_position(&mut self, position: Point) {
@@ -232,6 +254,15 @@ impl WindowBuilder {
         window.set_title(&self.title);
         window.set_resizable(self.resizable);
         window.set_decorated(self.show_titlebar);
+        let mut transparent = false;
+        if self.transparent {
+            if let Some(screen) = window.get_screen() {
+                let visual = screen.get_rgba_visual();
+                transparent = visual.is_some();
+                window.set_visual(visual.as_ref());
+            }
+        }
+        window.set_app_paintable(transparent);
 
         // Get the scale factor based on the GTK reported DPI
         let scale_factor =
@@ -253,6 +284,7 @@ impl WindowBuilder {
             window,
             scale: Cell::new(scale),
             area: Cell::new(area),
+            is_transparent: Cell::new(transparent),
             closing: Cell::new(false),
             drawing_area,
             surface: RefCell::new(None),
@@ -262,6 +294,7 @@ impl WindowBuilder {
             idle_queue: Arc::new(Mutex::new(vec![])),
             current_keycode: Cell::new(None),
             click_counter: ClickCounter::default(),
+            active_text_input: Cell::new(None),
             deferred_queue: RefCell::new(Vec::new()),
         });
 
@@ -322,9 +355,10 @@ impl WindowBuilder {
         if let Some(min_size_dp) = self.min_size {
             let min_area = ScaledArea::from_dp(min_size_dp, scale);
             let min_size_px = min_area.size_px();
-            win_state
-                .drawing_area
-                .set_size_request(min_size_px.width as i32, min_size_px.height as i32);
+            win_state.drawing_area.set_size_request(
+                min_size_px.width.round() as i32,
+                min_size_px.height.round() as i32,
+            );
         }
 
         win_state.drawing_area.connect_draw(clone!(handle => move |widget, context| {
@@ -354,7 +388,7 @@ impl WindowBuilder {
                     let size_dp = area.size_dp();
                     state.area.set(area);
                     if let Err(e) = state.resize_surface(extents.width, extents.height) {
-                        log::error!("Failed to resize surface: {}", e);
+                        error!("Failed to resize surface: {}", e);
                     }
                     state.with_handler(|h| h.size(size_dp));
                     state.invalidate_rect(size_dp.to_rect());
@@ -365,7 +399,7 @@ impl WindowBuilder {
                 let invalid = match state.invalid.try_borrow_mut() {
                     Ok(mut invalid) => std::mem::replace(&mut *invalid, Region::EMPTY),
                     Err(_) => {
-                        log::error!("invalid region borrowed while drawing");
+                        error!("invalid region borrowed while drawing");
                         Region::EMPTY
                     }
                 };
@@ -389,7 +423,7 @@ impl WindowBuilder {
                         let mut piet_context = Piet::new(&surface_context);
                         handler.paint(&mut piet_context, &invalid);
                         if let Err(e) = piet_context.finish() {
-                            log::error!("piet error on render: {:?}", e);
+                            error!("piet error on render: {:?}", e);
                         }
 
                         // Copy the entire surface to the drawing area (not just the invalid
@@ -401,12 +435,25 @@ impl WindowBuilder {
                         context.fill();
                     });
                 } else {
-                    log::warn!("Drawing was skipped because there was no surface");
+                    warn!("Drawing was skipped because there was no surface");
                 }
             }
 
             Inhibit(false)
         }));
+
+        win_state.drawing_area.connect_screen_changed(
+            clone!(handle => move |widget, _prev_screen| {
+                if let Some(state) = handle.state.upgrade() {
+
+                    if let Some(screen) = widget.get_screen(){
+                        let visual = screen.get_rgba_visual();
+                        state.is_transparent.set(visual.is_some());
+                        widget.set_visual(visual.as_ref());
+                    }
+                }
+            }),
+        );
 
         win_state.drawing_area.connect_button_press_event(clone!(handle => move |_widget, event| {
             if let Some(state) = handle.state.upgrade() {
@@ -544,7 +591,7 @@ impl WindowBuilder {
                             Some(Vec2::new(delta_x, delta_y))
                         }
                         e => {
-                            eprintln!(
+                            warn!(
                                 "Warning: the Druid widget got some whacky scroll direction {:?}",
                                 e
                             );
@@ -581,7 +628,7 @@ impl WindowBuilder {
                     state.current_keycode.set(Some(hw_keycode));
 
                     state.with_handler(|h|
-                        h.key_down(make_key_event(key, repeat, KeyState::Down))
+                        simulate_input(h, state.active_text_input.get(), make_key_event(key, repeat, KeyState::Down))
                     );
                 }
 
@@ -651,6 +698,10 @@ impl WindowBuilder {
             .expect("realize didn't create window")
             .set_event_compression(false);
 
+        if let Some(level) = self.level {
+            handle.set_override_redirect(level);
+        }
+
         let size = self.size;
         win_state.with_handler(|h| {
             h.connect(&handle.clone().into());
@@ -666,7 +717,7 @@ impl WindowState {
     #[track_caller]
     fn with_handler<T, F: FnOnce(&mut dyn WinHandler) -> T>(&self, f: F) -> Option<T> {
         if self.invalid.try_borrow_mut().is_err() || self.surface.try_borrow_mut().is_err() {
-            log::error!("other RefCells were borrowed when calling into the handler");
+            error!("other RefCells were borrowed when calling into the handler");
             return None;
         }
 
@@ -684,7 +735,7 @@ impl WindowState {
         match self.handler.try_borrow_mut() {
             Ok(mut h) => Some(f(&mut **h)),
             Err(_) => {
-                log::error!("failed to borrow WinHandler at {}", Location::caller());
+                error!("failed to borrow WinHandler at {}", Location::caller());
                 None
             }
         }
@@ -711,7 +762,11 @@ impl WindowState {
             *surface = None;
 
             if let Some(w) = self.drawing_area.get_window() {
-                *surface = w.create_similar_surface(cairo::Content::Color, width, height);
+                if self.is_transparent.get() {
+                    *surface = w.create_similar_surface(cairo::Content::ColorAlpha, width, height);
+                } else {
+                    *surface = w.create_similar_surface(cairo::Content::Color, width, height);
+                }
                 if surface.is_none() {
                     return Err(anyhow!("create_similar_surface failed"));
                 }
@@ -737,7 +792,7 @@ impl WindowState {
             region.add_rect(rect);
             self.window.queue_draw();
         } else {
-            log::warn!("Not invalidating rect because region already borrowed");
+            warn!("Not invalidating rect because region already borrowed");
         }
     }
 
@@ -805,22 +860,42 @@ impl WindowHandle {
 
     pub fn set_position(&self, position: Point) {
         if let Some(state) = self.state.upgrade() {
-            state.window.move_(position.x as i32, position.y as i32)
+            let px = position.to_px(state.scale.get());
+            state.window.move_(px.x as i32, px.y as i32)
         }
     }
 
     pub fn get_position(&self) -> Point {
         if let Some(state) = self.state.upgrade() {
             let (x, y) = state.window.get_position();
-            Point::new(x as f64, y as f64)
+            Point::new(x as f64, y as f64).to_dp(state.scale.get())
         } else {
             Point::new(0.0, 0.0)
         }
     }
 
+    /// The GTK implementation of content_insets differs from, e.g., the Windows one in that it
+    /// doesn't try to account for window decorations. Depending on the platform, GTK might not
+    /// even be aware of the size of the window decorations. And anyway, GTK's `Window::resize`
+    /// function [tries not to include] the window decorations, so it makes sense not to include
+    /// them here either.
+    ///
+    /// [tries not to include]: https://developer.gnome.org/gtk3/stable/GtkWidget.html#geometry-management
     pub fn content_insets(&self) -> Insets {
-        log::warn!("WindowHandle::content_insets unimplemented for GTK platforms.");
-        Insets::ZERO
+        if let Some(state) = self.state.upgrade() {
+            let scale = state.scale.get();
+            let (width_px, height_px) = state.window.get_size();
+            let alloc_px = state.drawing_area.get_allocation();
+            let window = Size::new(width_px as f64, height_px as f64).to_dp(scale);
+            let alloc = Rect::from_origin_size(
+                (alloc_px.x as f64, alloc_px.y as f64),
+                (alloc_px.width as f64, alloc_px.height as f64),
+            )
+            .to_dp(scale);
+            window.to_rect() - alloc
+        } else {
+            Insets::ZERO
+        }
     }
 
     pub fn set_level(&self, level: WindowLevel) {
@@ -834,35 +909,57 @@ impl WindowHandle {
 
             state.window.set_type_hint(hint);
         }
+
+        self.set_override_redirect(level);
+    }
+
+    /// The override-redirect flag tells the window manager not to mess with the window; it should
+    /// be set for things like tooltips, dropdowns, etc.
+    ///
+    /// Note that this is exposed on the GDK window, so we can't set it until the GTK window is
+    /// realized.
+    fn set_override_redirect(&self, level: WindowLevel) {
+        let override_redirect = match level {
+            WindowLevel::AppWindow => false,
+            WindowLevel::Tooltip | WindowLevel::DropDown | WindowLevel::Modal => true,
+        };
+        if let Some(state) = self.state.upgrade() {
+            if let Some(window) = state.window.get_window() {
+                window.set_override_redirect(override_redirect);
+            }
+        }
     }
 
     pub fn set_size(&self, size: Size) {
         if let Some(state) = self.state.upgrade() {
-            state.window.resize(size.width as i32, size.height as i32)
+            let px = size.to_px(state.scale.get());
+            state
+                .window
+                .resize(px.width.round() as i32, px.height.round() as i32)
         }
     }
 
     pub fn get_size(&self) -> Size {
         if let Some(state) = self.state.upgrade() {
             let (x, y) = state.window.get_size();
-            Size::new(x as f64, y as f64)
+            Size::new(x as f64, y as f64).to_dp(state.scale.get())
         } else {
-            log::warn!("Could not get size for GTK window");
+            warn!("Could not get size for GTK window");
             Size::new(0., 0.)
         }
     }
 
     pub fn set_window_state(&mut self, size_state: window::WindowState) {
-        use window::WindowState::{MAXIMIZED, MINIMIZED, RESTORED};
+        use window::WindowState::{Maximized, Minimized, Restored};
         let cur_size_state = self.get_window_state();
         if let Some(state) = self.state.upgrade() {
             match (size_state, cur_size_state) {
                 (s1, s2) if s1 == s2 => (),
-                (MAXIMIZED, _) => state.window.maximize(),
-                (MINIMIZED, _) => state.window.iconify(),
-                (RESTORED, MAXIMIZED) => state.window.unmaximize(),
-                (RESTORED, MINIMIZED) => state.window.deiconify(),
-                (RESTORED, RESTORED) => (), // Unreachable
+                (Maximized, _) => state.window.maximize(),
+                (Minimized, _) => state.window.iconify(),
+                (Restored, Maximized) => state.window.unmaximize(),
+                (Restored, Minimized) => state.window.deiconify(),
+                (Restored, Restored) => (), // Unreachable
             }
 
             state.window.unmaximize();
@@ -870,22 +967,22 @@ impl WindowHandle {
     }
 
     pub fn get_window_state(&self) -> window::WindowState {
-        use window::WindowState::{MAXIMIZED, MINIMIZED, RESTORED};
+        use window::WindowState::{Maximized, Minimized, Restored};
         if let Some(state) = self.state.upgrade() {
             if state.window.is_maximized() {
-                return MAXIMIZED;
+                return Maximized;
             } else if let Some(window) = state.window.get_parent_window() {
                 let state = window.get_state();
                 if (state & gdk::WindowState::ICONIFIED) == gdk::WindowState::ICONIFIED {
-                    return MINIMIZED;
+                    return Minimized;
                 }
             }
         }
-        RESTORED
+        Restored
     }
 
     pub fn handle_titlebar(&self, _val: bool) {
-        log::warn!("WindowHandle::handle_titlebar is currently unimplemented for gtk.");
+        warn!("WindowHandle::handle_titlebar is currently unimplemented for gtk.");
     }
 
     /// Close the window.
@@ -931,6 +1028,28 @@ impl WindowHandle {
         PietText::new()
     }
 
+    pub fn add_text_field(&self) -> TextFieldToken {
+        TextFieldToken::next()
+    }
+
+    pub fn remove_text_field(&self, token: TextFieldToken) {
+        if let Some(state) = self.state.upgrade() {
+            if state.active_text_input.get() == Some(token) {
+                state.active_text_input.set(None)
+            }
+        }
+    }
+
+    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
+        if let Some(state) = self.state.upgrade() {
+            state.active_text_input.set(active_field);
+        }
+    }
+
+    pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
+        // noop until we get a real text input implementation
+    }
+
     pub fn request_timer(&self, deadline: Instant) -> TimerToken {
         let interval = deadline
             .checked_duration_since(Instant::now())
@@ -939,7 +1058,7 @@ impl WindowHandle {
         let interval = match u32::try_from(interval) {
             Ok(iv) => iv,
             Err(_) => {
-                log::warn!("timer duration exceeds gtk max of 2^32 millis");
+                warn!("timer duration exceeds gtk max of 2^32 millis");
                 u32::max_value()
             }
         };
@@ -1047,7 +1166,8 @@ impl WindowHandle {
                 .unwrap();
 
             let first_child = &vbox.get_children()[0];
-            if first_child.is::<gtk::MenuBar>() {
+            if let Some(old_menubar) = first_child.downcast_ref::<gtk::MenuBar>() {
+                old_menubar.deactivate();
                 vbox.remove(first_child);
             }
             let menubar = menu.into_gtk_menubar(&self, &accel_group);
@@ -1085,7 +1205,7 @@ impl IdleHandle {
     /// priority than other UI events, but that's not necessarily the case.
     pub fn add_idle_callback<F>(&self, callback: F)
     where
-        F: FnOnce(&dyn Any) + Send + 'static,
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
         let mut queue = self.idle_queue.lock().unwrap();
         if let Some(state) = self.state.upgrade() {
@@ -1118,14 +1238,14 @@ fn run_idle(state: &Arc<WindowState>) -> glib::source::Continue {
 
         for item in queue {
             match item {
-                IdleKind::Callback(it) => it.call(handler.as_any()),
+                IdleKind::Callback(it) => it.call(handler),
                 IdleKind::Token(it) => handler.idle(it),
             }
         }
     });
 
     if result.is_none() {
-        log::warn!("Delaying idle callbacks because the handler is borrowed.");
+        warn!("Delaying idle callbacks because the handler is borrowed.");
         // Keep trying to reschedule this idle callback, because we haven't had a chance
         // to empty the idle queue. Returning glib::source::Continue(true) achieves this but
         // causes 100% CPU usage, apparently because glib likes to call us back very quickly.
@@ -1141,10 +1261,12 @@ fn make_gdk_cursor(cursor: &Cursor, gdk_window: &gdk::Window) -> Option<gdk::Cur
     } else {
         gdk::Cursor::from_name(
             &gdk_window.get_display(),
+            #[allow(deprecated)]
             match cursor {
                 // cursor name values from https://www.w3.org/TR/css-ui-3/#cursor
                 Cursor::Arrow => "default",
                 Cursor::IBeam => "text",
+                Cursor::Pointer => "pointer",
                 Cursor::Crosshair => "crosshair",
                 Cursor::OpenHand => "grab",
                 Cursor::NotAllowed => "not-allowed",
@@ -1198,7 +1320,7 @@ fn get_mouse_click_count(event_type: gdk::EventType) -> u8 {
         gdk::EventType::TripleButtonPress => 3,
         gdk::EventType::ButtonRelease => 0,
         _ => {
-            log::warn!("Unexpected mouse click event type: {:?}", event_type);
+            warn!("Unexpected mouse click event type: {:?}", event_type);
             0
         }
     }
@@ -1249,13 +1371,13 @@ fn make_key_event(key: &EventKey, repeat: bool, state: KeyState) -> KeyEvent {
     let is_composing = false;
 
     KeyEvent {
+        state,
         key,
         code,
         location,
         mods,
         repeat,
         is_composing,
-        state,
     }
 }
 

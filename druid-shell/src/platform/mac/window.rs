@@ -16,7 +16,6 @@
 
 #![allow(non_snake_case)]
 
-use std::any::Any;
 use std::ffi::c_void;
 use std::mem;
 use std::sync::{Arc, Mutex, Weak};
@@ -24,21 +23,24 @@ use std::time::Instant;
 
 use block::ConcreteBlock;
 use cocoa::appkit::{
-    CGFloat, NSApp, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreBuffered, NSEvent,
-    NSView, NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
+    CGFloat, NSApp, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreBuffered, NSColor,
+    NSEvent, NSView, NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
 };
 use cocoa::base::{id, nil, BOOL, NO, YES};
 use cocoa::foundation::{
-    NSAutoreleasePool, NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger,
+    NSArray, NSAutoreleasePool, NSInteger, NSPoint, NSRect, NSSize, NSString, NSUInteger,
 };
 use core_graphics::context::CGContextRef;
 use foreign_types::ForeignTypeRef;
 use lazy_static::lazy_static;
-use log::{error, info};
 use objc::declare::ClassDecl;
 use objc::rc::WeakPtr;
-use objc::runtime::{Class, Object, Sel};
+use objc::runtime::{Class, Object, Protocol, Sel};
 use objc::{class, msg_send, sel, sel_impl};
+use tracing::{debug, error, info};
+
+#[cfg(feature = "raw-win-handle")]
+use raw_window_handle::{macos::MacOSHandle, HasRawWindowHandle, RawWindowHandle};
 
 use crate::kurbo::{Insets, Point, Rect, Size, Vec2};
 use crate::piet::{Piet, PietText, RenderContext};
@@ -50,6 +52,7 @@ use super::application::Application;
 use super::dialog;
 use super::keyboard::{make_modifiers, KeyboardState};
 use super::menu::Menu;
+use super::text_input::NSRange;
 use super::util::{assert_main_thread, make_nsstring};
 use crate::common_util::IdleCallback;
 use crate::dialog::{FileDialogOptions, FileDialogType, FileInfo};
@@ -57,7 +60,10 @@ use crate::keyboard_types::KeyState;
 use crate::mouse::{Cursor, CursorDesc, MouseButton, MouseButtons, MouseEvent};
 use crate::region::Region;
 use crate::scale::Scale;
-use crate::window::{FileDialogToken, IdleToken, TimerToken, WinHandler, WindowLevel, WindowState};
+use crate::text::{Event, InputHandler};
+use crate::window::{
+    FileDialogToken, IdleToken, TextFieldToken, TimerToken, WinHandler, WindowLevel, WindowState,
+};
 use crate::Error;
 
 #[allow(non_upper_case_globals)]
@@ -119,6 +125,7 @@ pub(crate) struct WindowBuilder {
     window_state: Option<WindowState>,
     resizable: bool,
     show_titlebar: bool,
+    transparent: bool,
 }
 
 #[derive(Clone)]
@@ -151,6 +158,7 @@ struct ViewState {
     mouse_left: bool,
     keyboard_state: KeyboardState,
     text: PietText,
+    active_text_input: Option<TextFieldToken>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -163,13 +171,14 @@ impl WindowBuilder {
             handler: None,
             title: String::new(),
             menu: None,
-            size: Size::new(0., 0.),
+            size: Size::new(500., 400.),
             min_size: None,
             position: None,
             level: None,
             window_state: None,
             resizable: true,
             show_titlebar: true,
+            transparent: false,
         }
     }
 
@@ -191,6 +200,10 @@ impl WindowBuilder {
 
     pub fn show_titlebar(&mut self, show_titlebar: bool) {
         self.show_titlebar = show_titlebar;
+    }
+
+    pub fn set_transparent(&mut self, transparent: bool) {
+        self.transparent = transparent;
     }
 
     pub fn set_level(&mut self, level: WindowLevel) {
@@ -246,6 +259,11 @@ impl WindowBuilder {
                 window.setContentMinSize_(size);
             }
 
+            if self.transparent {
+                window.setOpaque_(NO);
+                window.setBackgroundColor_(NSColor::clearColor(nil));
+            }
+
             window.setTitle_(make_nsstring(&self.title));
 
             let (view, idle_queue) = make_view(self.handler.expect("view"));
@@ -274,6 +292,9 @@ impl WindowBuilder {
             if let Some(level) = self.level {
                 handle.set_level(level)
             }
+
+            // set_window_state above could have invalidated the frame size
+            let frame = NSView::frame(content_view);
 
             (*view_state).handler.connect(&handle.clone().into());
             (*view_state).handler.scale(Scale::default());
@@ -431,8 +452,69 @@ lazy_static! {
             sel!(windowWillClose:),
             window_will_close as extern "C" fn(&mut Object, Sel, id),
         );
+
+        // methods for NSTextInputClient
+        decl.add_method(sel!(hasMarkedText), super::text_input::has_marked_text as extern fn(&mut Object, Sel) -> BOOL);
+        decl.add_method(
+            sel!(markedRange),
+            super::text_input::marked_range as extern fn(&mut Object, Sel) -> NSRange,
+        );
+        decl.add_method(sel!(selectedRange), super::text_input::selected_range as extern fn(&mut Object, Sel) -> NSRange);
+        decl.add_method(
+            sel!(setMarkedText:selectedRange:replacementRange:),
+            super::text_input::set_marked_text as extern fn(&mut Object, Sel, id, NSRange, NSRange),
+        );
+        decl.add_method(sel!(unmarkText), super::text_input::unmark_text as extern fn(&mut Object, Sel));
+        decl.add_method(
+            sel!(validAttributesForMarkedText),
+            super::text_input::valid_attributes_for_marked_text as extern fn(&mut Object, Sel) -> id,
+        );
+        decl.add_method(
+            sel!(attributedSubstringForProposedRange:actualRange:),
+            super::text_input::attributed_substring_for_proposed_range
+                as extern fn(&mut Object, Sel, NSRange, *mut c_void) -> id,
+        );
+        decl.add_method(
+            sel!(insertText:replacementRange:),
+            super::text_input::insert_text as extern fn(&mut Object, Sel, id, NSRange),
+        );
+        decl.add_method(
+            sel!(characterIndexForPoint:),
+            super::text_input::character_index_for_point as extern fn(&mut Object, Sel, NSPoint) -> NSUInteger,
+        );
+        decl.add_method(
+            sel!(firstRectForCharacterRange:actualRange:),
+            super::text_input::first_rect_for_character_range
+                as extern fn(&mut Object, Sel, NSRange, *mut c_void) -> NSRect,
+        );
+        decl.add_method(
+            sel!(doCommandBySelector:),
+            super::text_input::do_command_by_selector as extern fn(&mut Object, Sel, Sel),
+        );
+
+        let protocol = Protocol::get("NSTextInputClient").unwrap();
+        decl.add_protocol(&protocol);
+
         ViewClass(decl.register())
     };
+}
+
+/// Acquires a lock to an `InputHandler`, passes it to a closure, and releases the lock.
+pub(super) fn with_edit_lock_from_window<R>(
+    this: &mut Object,
+    mutable: bool,
+    f: impl FnOnce(Box<dyn InputHandler>) -> R,
+) -> Option<R> {
+    let view_state = unsafe {
+        let view_state: *mut c_void = *this.get_ivar("viewState");
+        let view_state = &mut *(view_state as *mut ViewState);
+        &mut (*view_state)
+    };
+    let input_token = view_state.active_text_input?;
+    let handler = view_state.handler.acquire_input_lock(input_token, mutable);
+    let r = f(handler);
+    view_state.handler.release_input_lock(input_token);
+    Some(r)
 }
 
 fn make_view(handler: Box<dyn WinHandler>) -> (id, Weak<Mutex<Vec<IdleKind>>>) {
@@ -450,6 +532,7 @@ fn make_view(handler: Box<dyn WinHandler>) -> (id, Weak<Mutex<Vec<IdleKind>>>) {
             mouse_left: true,
             keyboard_state,
             text: PietText::new_with_unique_state(),
+            active_text_input: None,
         };
         let state_ptr = Box::into_raw(Box::new(state));
         (*view).set_ivar("viewState", state_ptr as *mut c_void);
@@ -695,7 +778,13 @@ extern "C" fn key_down(this: &mut Object, _: Sel, nsevent: id) {
         &mut *(view_state as *mut ViewState)
     };
     if let Some(event) = (*view_state).keyboard_state.process_native_event(nsevent) {
-        (*view_state).handler.key_down(event);
+        if !(*view_state).handler.key_down(event) {
+            // key down not handled; foward to text input system
+            unsafe {
+                let events = NSArray::arrayWithObjects(nil, &[nsevent]);
+                let _: () = msg_send![*(*view_state).nsview.load(), interpretKeyEvents: events];
+            }
+        }
     }
 }
 
@@ -799,7 +888,7 @@ fn set_position_deferred(this: &mut Object, _view_state: &mut ViewState, positio
         let screen_height = crate::Screen::get_display_rect().height();
         new_frame.origin.y = screen_height - position.y - frame.size.height; // Flip back
         let () = msg_send![window, setFrame: new_frame display: YES];
-        log::debug!("set_position_deferred {:?}", position);
+        debug!("set_position_deferred {:?}", position);
     }
 }
 
@@ -814,7 +903,7 @@ extern "C" fn run_idle(this: &mut Object, _: Sel) {
     );
     for item in queue {
         match item {
-            IdleKind::Callback(it) => it.call(view_state.handler.as_any()),
+            IdleKind::Callback(it) => it.call(&mut *view_state.handler),
             IdleKind::Token(it) => {
                 view_state.handler.as_mut().idle(it);
             }
@@ -956,9 +1045,11 @@ impl WindowHandle {
     pub fn set_cursor(&mut self, cursor: &Cursor) {
         unsafe {
             let nscursor = class!(NSCursor);
+            #[allow(deprecated)]
             let cursor: id = match cursor {
                 Cursor::Arrow => msg_send![nscursor, arrowCursor],
                 Cursor::IBeam => msg_send![nscursor, IBeamCursor],
+                Cursor::Pointer => msg_send![nscursor, pointingHandCursor],
                 Cursor::Crosshair => msg_send![nscursor, crosshairCursor],
                 Cursor::OpenHand => msg_send![nscursor, openHandCursor],
                 Cursor::NotAllowed => msg_send![nscursor, operationNotAllowedCursor],
@@ -972,7 +1063,7 @@ impl WindowHandle {
     }
 
     pub fn make_cursor(&self, _cursor_desc: &CursorDesc) -> Option<Cursor> {
-        log::warn!("Custom cursors are not yet supported in the macOS backend");
+        tracing::warn!("Custom cursors are not yet supported in the macOS backend");
         None
     }
 
@@ -1001,6 +1092,66 @@ impl WindowHandle {
             } else {
                 // this codepath should only happen during tests in druid, when view is nil
                 PietText::new_with_unique_state()
+            }
+        }
+    }
+
+    pub fn add_text_field(&self) -> TextFieldToken {
+        TextFieldToken::next()
+    }
+
+    pub fn remove_text_field(&self, token: TextFieldToken) {
+        let view = self.nsview.load();
+        unsafe {
+            if let Some(view) = (*view).as_ref() {
+                let state: *mut c_void = *view.get_ivar("viewState");
+                let state = &mut (*(state as *mut ViewState));
+                if state.active_text_input == Some(token) {
+                    state.active_text_input = None;
+                }
+            }
+        }
+    }
+
+    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
+        unsafe {
+            if let Some(view) = self.nsview.load().as_ref() {
+                let state: *mut c_void = *view.get_ivar("viewState");
+                let state = &mut (*(state as *mut ViewState));
+
+                if let Some(old_field) = state.active_text_input {
+                    self.update_text_field(old_field, Event::Reset);
+                }
+                state.active_text_input = active_field;
+                if let Some(new_field) = active_field {
+                    self.update_text_field(new_field, Event::Reset);
+                }
+            }
+        }
+    }
+
+    pub fn update_text_field(&self, token: TextFieldToken, update: Event) {
+        unsafe {
+            if let Some(view) = self.nsview.load().as_ref() {
+                let state: *mut c_void = *view.get_ivar("viewState");
+                let state = &mut (*(state as *mut ViewState));
+
+                if state.active_text_input != Some(token) {
+                    return;
+                }
+                match update {
+                    Event::LayoutChanged => {
+                        let input_context: id = msg_send![*self.nsview.load(), inputContext];
+                        let _: () = msg_send![input_context, invalidateCharacterCoordinates];
+                    }
+                    Event::Reset | Event::SelectionChanged => {
+                        let input_context: id = msg_send![*self.nsview.load(), inputContext];
+                        let _: () = msg_send![input_context, discardMarkedText];
+                        let mut edit_lock = state.handler.acquire_input_lock(token, true);
+                        edit_lock.set_composition_range(None);
+                        state.handler.release_input_lock(token);
+                    }
+                }
             }
         }
     }
@@ -1122,14 +1273,14 @@ impl WindowHandle {
             let window: id = msg_send![*self.nsview.load(), window];
             let isMin: BOOL = msg_send![window, isMiniaturized];
             if isMin != NO {
-                return WindowState::MINIMIZED;
+                return WindowState::Minimized;
             }
             let isZoomed: BOOL = msg_send![window, isZoomed];
             if isZoomed != NO {
-                return WindowState::MAXIMIZED;
+                return WindowState::Maximized;
             }
         }
-        WindowState::RESTORED
+        WindowState::Restored
     }
 
     pub fn set_window_state(&mut self, state: WindowState) {
@@ -1138,25 +1289,25 @@ impl WindowHandle {
             let window: id = msg_send![*self.nsview.load(), window];
             match (state, cur_state) {
                 (s1, s2) if s1 == s2 => (),
-                (WindowState::MINIMIZED, _) => {
+                (WindowState::Minimized, _) => {
                     let () = msg_send![window, performMiniaturize: self];
                 }
-                (WindowState::MAXIMIZED, _) => {
+                (WindowState::Maximized, _) => {
                     let () = msg_send![window, performZoom: self];
                 }
-                (WindowState::RESTORED, WindowState::MAXIMIZED) => {
+                (WindowState::Restored, WindowState::Maximized) => {
                     let () = msg_send![window, performZoom: self];
                 }
-                (WindowState::RESTORED, WindowState::MINIMIZED) => {
+                (WindowState::Restored, WindowState::Minimized) => {
                     let () = msg_send![window, deminiaturize: self];
                 }
-                (WindowState::RESTORED, WindowState::RESTORED) => {} // Can't be reached
+                (WindowState::Restored, WindowState::Restored) => {} // Can't be reached
             }
         }
     }
 
     pub fn handle_titlebar(&self, _val: bool) {
-        log::warn!("WindowHandle::handle_titlebar is currently unimplemented for Mac.");
+        tracing::warn!("WindowHandle::handle_titlebar is currently unimplemented for Mac.");
     }
 
     pub fn resizable(&self, resizable: bool) {
@@ -1214,6 +1365,18 @@ impl WindowHandle {
     }
 }
 
+#[cfg(feature = "raw-win-handle")]
+unsafe impl HasRawWindowHandle for WindowHandle {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        let nsv = self.nsview.load();
+        let handle = MacOSHandle {
+            ns_view: *nsv as *mut _,
+            ..MacOSHandle::empty()
+        };
+        RawWindowHandle::MacOS(handle)
+    }
+}
+
 unsafe impl Send for IdleHandle {}
 
 impl IdleHandle {
@@ -1240,7 +1403,7 @@ impl IdleHandle {
     /// priority than other UI events, but that's not necessarily the case.
     pub fn add_idle_callback<F>(&self, callback: F)
     where
-        F: FnOnce(&dyn Any) + Send + 'static,
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
         self.add_idle(IdleKind::Callback(Box::new(callback)));
     }

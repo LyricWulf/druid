@@ -404,7 +404,7 @@ struct State {
 }
 
 pub fn main() {
-    let main_window = WindowDesc::new(ui_builder).title(
+    let main_window = WindowDesc::new(ui_builder()).title(
         LocalizedString::new("wgpu_view-demo-window-title").with_placeholder("wgpu integration"),
     );
     //let sub_window = WindowDesc::new(sub_ui_builder).set_parent(main_window);

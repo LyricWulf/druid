@@ -14,16 +14,18 @@
 
 //! Web window creation and management.
 
-use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
 use instant::Instant;
-
+use tracing::{error, warn};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+#[cfg(feature = "raw-win-handle")]
+use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 
 use crate::kurbo::{Insets, Point, Rect, Size, Vec2};
 
@@ -38,11 +40,14 @@ use crate::dialog::{FileDialogOptions, FileDialogType};
 use crate::error::Error as ShellError;
 use crate::scale::{Scale, ScaledArea};
 
-use crate::keyboard::{KbKey, KeyState, Modifiers};
+use crate::keyboard::{KeyState, Modifiers};
 use crate::mouse::{Cursor, CursorDesc, MouseButton, MouseButtons, MouseEvent};
 use crate::region::Region;
+use crate::text::{simulate_input, Event};
 use crate::window;
-use crate::window::{FileDialogToken, IdleToken, TimerToken, WinHandler, WindowLevel};
+use crate::window::{
+    FileDialogToken, IdleToken, TextFieldToken, TimerToken, WinHandler, WindowLevel,
+};
 
 // This is a macro instead of a function since KeyboardEvent and MouseEvent has identical functions
 // to query modifier key states.
@@ -75,6 +80,14 @@ pub(crate) struct WindowBuilder {
 #[derive(Clone, Default)]
 pub struct WindowHandle(Weak<WindowState>);
 
+#[cfg(feature = "raw-win-handle")]
+unsafe impl HasRawWindowHandle for WindowHandle {
+    fn raw_window_handle(&self) -> RawWindowHandle {
+        error!("HasRawWindowHandle trait not implemented for wasm.");
+        RawWindowHandle::Web(WebHandle::empty())
+    }
+}
+
 /// A handle that can get used to schedule an idle handler. Note that
 /// this handle is thread safe.
 #[derive(Clone)]
@@ -98,6 +111,8 @@ struct WindowState {
     context: web_sys::CanvasRenderingContext2d,
     invalid: RefCell<Region>,
     click_counter: ClickCounter,
+    active_text_input: Cell<Option<TextFieldToken>>,
+    rendering_soon: Cell<bool>,
 }
 
 // TODO: support custom cursors
@@ -115,10 +130,10 @@ impl WindowState {
             self.handler.borrow_mut().paint(&mut ctx, &invalid);
             Ok(())
         }) {
-            log::error!("piet error on render: {:?}", e);
+            error!("piet error on render: {:?}", e);
         }
         if let Err(e) = piet_ctx.finish() {
-            log::error!("piet error finishing render: {:?}", e);
+            error!("piet error finishing render: {:?}", e);
         }
         self.invalid.borrow_mut().clear();
     }
@@ -127,7 +142,7 @@ impl WindowState {
         let mut queue = self.idle_queue.lock().expect("process_idle_queue");
         for item in queue.drain(..) {
             match item {
-                IdleKind::Callback(cb) => cb.call(&self.handler),
+                IdleKind::Callback(cb) => cb.call(&mut **self.handler.borrow_mut()),
                 IdleKind::Token(tok) => self.handler.borrow_mut().idle(tok),
             }
         }
@@ -238,7 +253,7 @@ fn setup_scroll_callback(ws: &Rc<WindowState>) {
                 Vec2::new(size_dp.width * dx, size_dp.height * dy)
             }
             _ => {
-                log::warn!("Invalid deltaMode in WheelEvent: {}", delta_mode);
+                warn!("Invalid deltaMode in WheelEvent: {}", delta_mode);
                 return;
             }
         };
@@ -280,11 +295,10 @@ fn setup_keydown_callback(ws: &Rc<WindowState>) {
     register_window_event_listener(ws, "keydown", move |event: web_sys::KeyboardEvent| {
         let modifiers = get_modifiers!(event);
         let kb_event = convert_keyboard_event(&event, modifiers, KeyState::Down);
-        if kb_event.key == KbKey::Backspace {
-            // Prevent the browser from going back a page by default.
+        let mut handler = state.handler.borrow_mut();
+        if simulate_input(&mut **handler, state.active_text_input.get(), kb_event) {
             event.prevent_default();
         }
-        state.handler.borrow_mut().key_down(kb_event);
     });
 }
 
@@ -357,6 +371,10 @@ impl WindowBuilder {
         // Ignored
     }
 
+    pub fn set_transparent(&mut self, _transparent: bool) {
+        // Ignored
+    }
+
     pub fn set_position(&mut self, _position: Point) {
         // Ignored
     }
@@ -421,6 +439,8 @@ impl WindowBuilder {
             context,
             invalid: RefCell::new(Region::EMPTY),
             click_counter: ClickCounter::default(),
+            active_text_input: Cell::new(None),
+            rendering_soon: Cell::new(false),
         });
 
         setup_web_callbacks(&window);
@@ -448,51 +468,51 @@ impl WindowHandle {
     }
 
     pub fn resizable(&self, _resizable: bool) {
-        log::warn!("resizable unimplemented for web");
+        warn!("resizable unimplemented for web");
     }
 
     pub fn show_titlebar(&self, _show_titlebar: bool) {
-        log::warn!("show_titlebar unimplemented for web");
+        warn!("show_titlebar unimplemented for web");
     }
 
     pub fn set_position(&self, _position: Point) {
-        log::warn!("WindowHandle::set_position unimplemented for web");
+        warn!("WindowHandle::set_position unimplemented for web");
     }
 
     pub fn set_level(&self, _level: WindowLevel) {
-        log::warn!("WindowHandle::set_level  is currently unimplemented for web.");
+        warn!("WindowHandle::set_level  is currently unimplemented for web.");
     }
 
     pub fn get_position(&self) -> Point {
-        log::warn!("WindowHandle::get_position unimplemented for web.");
+        warn!("WindowHandle::get_position unimplemented for web.");
         Point::new(0.0, 0.0)
     }
 
     pub fn set_size(&self, _size: Size) {
-        log::warn!("WindowHandle::set_size unimplemented for web.");
+        warn!("WindowHandle::set_size unimplemented for web.");
     }
 
     pub fn get_size(&self) -> Size {
-        log::warn!("WindowHandle::get_size unimplemented for web.");
+        warn!("WindowHandle::get_size unimplemented for web.");
         Size::new(0.0, 0.0)
     }
 
     pub fn content_insets(&self) -> Insets {
-        log::warn!("WindowHandle::content_insets unimplemented for web.");
+        warn!("WindowHandle::content_insets unimplemented for web.");
         Insets::ZERO
     }
 
     pub fn set_window_state(&self, _state: window::WindowState) {
-        log::warn!("WindowHandle::set_window_state unimplemented for web.");
+        warn!("WindowHandle::set_window_state unimplemented for web.");
     }
 
     pub fn get_window_state(&self) -> window::WindowState {
-        log::warn!("WindowHandle::get_window_state unimplemented for web.");
-        window::WindowState::RESTORED
+        warn!("WindowHandle::get_window_state unimplemented for web.");
+        window::WindowState::Restored
     }
 
     pub fn handle_titlebar(&self, _val: bool) {
-        log::warn!("WindowHandle::handle_titlebar unimplemented for web.");
+        warn!("WindowHandle::handle_titlebar unimplemented for web.");
     }
 
     pub fn close(&self) {
@@ -500,7 +520,7 @@ impl WindowHandle {
     }
 
     pub fn bring_to_front_and_focus(&self) {
-        log::warn!("bring_to_frontand_focus unimplemented for web");
+        warn!("bring_to_frontand_focus unimplemented for web");
     }
 
     pub fn request_anim_frame(&self) {
@@ -532,13 +552,35 @@ impl WindowHandle {
         PietText::new(s.context.clone())
     }
 
+    pub fn add_text_field(&self) -> TextFieldToken {
+        TextFieldToken::next()
+    }
+
+    pub fn remove_text_field(&self, token: TextFieldToken) {
+        if let Some(state) = self.0.upgrade() {
+            if state.active_text_input.get() == Some(token) {
+                state.active_text_input.set(None);
+            }
+        }
+    }
+
+    pub fn set_focused_text_field(&self, active_field: Option<TextFieldToken>) {
+        if let Some(state) = self.0.upgrade() {
+            state.active_text_input.set(active_field);
+        }
+    }
+
+    pub fn update_text_field(&self, _token: TextFieldToken, _update: Event) {
+        // no-op for now, until we get a properly implemented text input
+    }
+
     pub fn request_timer(&self, deadline: Instant) -> TimerToken {
         use std::convert::TryFrom;
         let interval = deadline.duration_since(Instant::now()).as_millis();
         let interval = match i32::try_from(interval) {
             Ok(iv) => iv,
             Err(_) => {
-                log::warn!("Timer duration exceeds 32 bit integer max");
+                warn!("Timer duration exceeds 32 bit integer max");
                 i32::max_value()
             }
         };
@@ -570,27 +612,31 @@ impl WindowHandle {
     }
 
     pub fn make_cursor(&self, _cursor_desc: &CursorDesc) -> Option<Cursor> {
-        log::warn!("Custom cursors are not yet supported in the web backend");
+        warn!("Custom cursors are not yet supported in the web backend");
         None
     }
 
     pub fn open_file(&mut self, _options: FileDialogOptions) -> Option<FileDialogToken> {
-        log::warn!("open_file is currently unimplemented for web.");
+        warn!("open_file is currently unimplemented for web.");
         None
     }
 
     pub fn save_as(&mut self, _options: FileDialogOptions) -> Option<FileDialogToken> {
-        log::warn!("save_as is currently unimplemented for web.");
+        warn!("save_as is currently unimplemented for web.");
         None
     }
 
     fn render_soon(&self) {
         if let Some(s) = self.0.upgrade() {
             let state = s.clone();
-            s.request_animation_frame(move || {
-                state.render();
-            })
-            .expect("Failed to request animation frame");
+            if !state.rendering_soon.get() {
+                state.rendering_soon.set(true);
+                s.request_animation_frame(move || {
+                    state.rendering_soon.set(false);
+                    state.render();
+                })
+                .expect("Failed to request animation frame");
+            }
         }
     }
 
@@ -621,11 +667,11 @@ impl WindowHandle {
     }
 
     pub fn set_menu(&self, _menu: Menu) {
-        log::warn!("set_menu unimplemented for web");
+        warn!("set_menu unimplemented for web");
     }
 
     pub fn show_context_menu(&self, _menu: Menu, _pos: Point) {
-        log::warn!("show_context_menu unimplemented for web");
+        warn!("show_context_menu unimplemented for web");
     }
 
     pub fn set_title(&self, title: impl Into<String>) {
@@ -641,7 +687,7 @@ impl IdleHandle {
     /// Add an idle handler, which is called (once) when the main thread is idle.
     pub fn add_idle_callback<F>(&self, callback: F)
     where
-        F: FnOnce(&dyn Any) + Send + 'static,
+        F: FnOnce(&mut dyn WinHandler) + Send + 'static,
     {
         let mut queue = self.queue.lock().expect("IdleHandle::add_idle queue");
         queue.push(IdleKind::Callback(Box::new(callback)));
@@ -711,9 +757,11 @@ fn set_cursor(canvas: &web_sys::HtmlCanvasElement, cursor: &Cursor) {
         .style()
         .set_property(
             "cursor",
+            #[allow(deprecated)]
             match cursor {
                 Cursor::Arrow => "default",
                 Cursor::IBeam => "text",
+                Cursor::Pointer => "pointer",
                 Cursor::Crosshair => "crosshair",
                 Cursor::OpenHand => "grab",
                 Cursor::NotAllowed => "not-allowed",
@@ -723,5 +771,5 @@ fn set_cursor(canvas: &web_sys::HtmlCanvasElement, cursor: &Cursor) {
                 Cursor::Custom(_) => "default",
             },
         )
-        .unwrap_or_else(|_| log::warn!("Failed to set cursor"));
+        .unwrap_or_else(|_| warn!("Failed to set cursor"));
 }

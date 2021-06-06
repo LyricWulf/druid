@@ -20,6 +20,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use tracing::{instrument, trace};
 
 use crate::kurbo::{Circle, Line};
 use crate::widget::prelude::*;
@@ -279,10 +280,7 @@ impl<TP: TabsPolicy> TabBar<TP> {
             let label = data
                 .policy
                 .tab_label(key.clone(), info, &data.inner)
-                // TODO: Type inference fails here because both sides of the lens are dependent on
-                // associated types of the policy. Needs changes to lens derivation to embed PhantomData of the (relevant?) type params)
-                // of the lensed types into the lens, so type inference has something to grab hold of
-                .lens::<TabsState<TP>, tabs_state_derived_lenses::inner>(TabsState::<TP>::inner)
+                .lens(TabsState::<TP>::inner)
                 .padding(Insets::uniform_xy(9., 5.));
 
             if can_close {
@@ -338,6 +336,7 @@ impl<TP: TabsPolicy> TabBar<TP> {
 }
 
 impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
+    #[instrument(name = "TabBar", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut TabsState<TP>, env: &Env) {
         match event {
             Event::MouseDown(e) => {
@@ -364,6 +363,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
         }
     }
 
+    #[instrument(name = "TabBar", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(
         &mut self,
         ctx: &mut LifeCycleCtx,
@@ -382,6 +382,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
         }
     }
 
+    #[instrument(name = "TabBar", level = "trace", skip(self, ctx, old_data, data, env))]
     fn update(
         &mut self,
         ctx: &mut UpdateCtx,
@@ -402,6 +403,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
         }
     }
 
+    #[instrument(name = "TabBar", level = "trace", skip(self, ctx, bc, data, env))]
     fn layout(
         &mut self,
         ctx: &mut LayoutCtx,
@@ -418,9 +420,12 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabBar<TP> {
             minor = minor.max(self.axis.minor(size));
         }
         let wanted = self.axis.pack(major.max(self.axis.major(bc.max())), minor);
-        bc.constrain(wanted)
+        let size = bc.constrain(wanted);
+        trace!("Computed size: {}", size);
+        size
     }
 
+    #[instrument(name = "TabBar", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &TabsState<TP>, env: &Env) {
         let hl_thickness = 2.;
         let highlight = env.get(theme::PRIMARY_LIGHT);
@@ -580,6 +585,7 @@ impl<TP: TabsPolicy> TabsBody<TP> {
 }
 
 impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
+    #[instrument(name = "TabsBody", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut TabsState<TP>, env: &Env) {
         if event.should_propagate_to_hidden() {
             for child in self.child_pods() {
@@ -600,6 +606,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         }
     }
 
+    #[instrument(name = "TabsBody", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(
         &mut self,
         ctx: &mut LifeCycleCtx,
@@ -623,6 +630,11 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         }
     }
 
+    #[instrument(
+        name = "TabsBody",
+        level = "trace",
+        skip(self, ctx, old_data, data, env)
+    )]
     fn update(
         &mut self,
         ctx: &mut UpdateCtx,
@@ -663,6 +675,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         }
     }
 
+    #[instrument(name = "TabsBody", level = "trace", skip(self, ctx, bc, data, env))]
     fn layout(
         &mut self,
         ctx: &mut LayoutCtx,
@@ -680,6 +693,7 @@ impl<TP: TabsPolicy> Widget<TabsState<TP>> for TabsBody<TP> {
         bc.max()
     }
 
+    #[instrument(name = "TabsBody", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &TabsState<TP>, env: &Env) {
         if let Some(trans) = &self.transition_state {
             let axis = self.axis;
@@ -726,7 +740,7 @@ impl<TP> TabsScopePolicy<TP> {
 impl<TP: TabsPolicy> ScopePolicy for TabsScopePolicy<TP> {
     type In = TP::Input;
     type State = TabsState<TP>;
-    type Transfer = LensScopeTransfer<tabs_state_derived_lenses::inner, Self::In, Self::State>;
+    type Transfer = LensScopeTransfer<tabs_state_derived_lenses::inner<TP>, Self::In, Self::State>;
 
     fn create(self, inner: &Self::In) -> (Self::State, Self::Transfer) {
         (
@@ -919,28 +933,23 @@ impl<TP: TabsPolicy> Tabs<TP> {
         if let TabsContent::Building { tabs } = &mut self.content {
             TP::add_tab(tabs, name, child)
         } else {
-            log::warn!("Can't add static tabs to a running or complete tabs instance!")
+            tracing::warn!("Can't add static tabs to a running or complete tabs instance!")
         }
     }
 
     fn make_scope(&self, tabs_from_data: TP) -> WidgetPod<TP::Input, TabsScope<TP>> {
-        let (tabs_bar, tabs_body) = (
-            (TabBar::new(self.axis, self.edge), 0.0),
-            (
-                TabsBody::new(self.axis, self.transition)
-                    .padding(5.)
-                    .border(theme::BORDER_DARK, 0.5),
-                1.0,
-            ),
-        );
+        let tabs_bar = TabBar::new(self.axis, self.edge);
+        let tabs_body = TabsBody::new(self.axis, self.transition)
+            .padding(5.)
+            .border(theme::BORDER_DARK, 0.5);
         let mut layout: Flex<TabsState<TP>> = Flex::for_axis(self.axis.cross());
 
         if let TabsEdge::Trailing = self.edge {
-            layout.add_flex_child(tabs_body.0, tabs_body.1);
-            layout.add_flex_child(tabs_bar.0, tabs_bar.1);
+            layout.add_flex_child(tabs_body, 1.);
+            layout.add_child(tabs_bar);
         } else {
-            layout.add_flex_child(tabs_bar.0, tabs_bar.1);
-            layout.add_flex_child(tabs_body.0, tabs_body.1);
+            layout.add_child(tabs_bar);
+            layout.add_flex_child(tabs_body, 1.);
         };
 
         WidgetPod::new(Scope::new(
@@ -951,12 +960,14 @@ impl<TP: TabsPolicy> Tabs<TP> {
 }
 
 impl<TP: TabsPolicy> Widget<TP::Input> for Tabs<TP> {
+    #[instrument(name = "Tabs", level = "trace", skip(self, ctx, event, data, env))]
     fn event(&mut self, ctx: &mut EventCtx, event: &Event, data: &mut TP::Input, env: &Env) {
         if let TabsContent::Running { scope } = &mut self.content {
             scope.event(ctx, event, data, env);
         }
     }
 
+    #[instrument(name = "Tabs", level = "trace", skip(self, ctx, event, data, env))]
     fn lifecycle(
         &mut self,
         ctx: &mut LifeCycleCtx,
@@ -988,12 +999,14 @@ impl<TP: TabsPolicy> Widget<TP::Input> for Tabs<TP> {
         }
     }
 
+    #[instrument(name = "Tabs", level = "trace", skip(self, ctx, _old_data, data, env))]
     fn update(&mut self, ctx: &mut UpdateCtx, _old_data: &TP::Input, data: &TP::Input, env: &Env) {
         if let TabsContent::Running { scope } = &mut self.content {
             scope.update(ctx, data, env);
         }
     }
 
+    #[instrument(name = "Tabs", level = "trace", skip(self, ctx, bc, data, env))]
     fn layout(
         &mut self,
         ctx: &mut LayoutCtx,
@@ -1010,6 +1023,7 @@ impl<TP: TabsPolicy> Widget<TP::Input> for Tabs<TP> {
         }
     }
 
+    #[instrument(name = "Tabs", level = "trace", skip(self, ctx, data, env))]
     fn paint(&mut self, ctx: &mut PaintCtx, data: &TP::Input, env: &Env) {
         if let TabsContent::Running { scope } = &mut self.content {
             scope.paint(ctx, data, env)

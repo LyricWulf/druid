@@ -84,6 +84,7 @@ impl<'a> TargetGuard<'a> {
     }
 }
 
+#[allow(missing_docs)]
 impl<T: Data> Harness<'_, T> {
     /// Create a new `Harness` with the given data and a root widget,
     /// and provide that harness to the passed in function.
@@ -148,7 +149,7 @@ impl<T: Data> Harness<'_, T> {
         {
             let piet = target.0.as_mut().unwrap().render_context();
 
-            let pending = PendingWindow::new(|| root);
+            let pending = PendingWindow::new(root);
             let window = Window::new(WindowId::next(), Default::default(), pending, ext_handle);
 
             let inner = Inner {
@@ -189,7 +190,7 @@ impl<T: Data> Harness<'_, T> {
     }
 
     /// Retrieve a copy of this widget's `WidgetState`, or die trying.
-    pub(crate) fn get_state(&mut self, widget: WidgetId) -> WidgetState {
+    pub fn get_state(&mut self, widget: WidgetId) -> WidgetState {
         match self.try_get_state(widget) {
             Some(thing) => thing,
             None => panic!("get_state failed for widget {:?}", widget),
@@ -197,7 +198,7 @@ impl<T: Data> Harness<'_, T> {
     }
 
     /// Attempt to retrieve a copy of this widget's `WidgetState`.
-    pub(crate) fn try_get_state(&mut self, widget: WidgetId) -> Option<WidgetState> {
+    pub fn try_get_state(&mut self, widget: WidgetId) -> Option<WidgetState> {
         let cell = StateCell::default();
         let state_cell = cell.clone();
         self.lifecycle(LifeCycle::Internal(InternalLifeCycle::DebugRequestState {
@@ -210,7 +211,7 @@ impl<T: Data> Harness<'_, T> {
     /// Inspect the `WidgetState` of each widget in the tree.
     ///
     /// The provided closure will be called on each widget.
-    pub(crate) fn inspect_state(&mut self, f: impl Fn(&WidgetState) + 'static) {
+    pub fn inspect_state(&mut self, f: impl Fn(&WidgetState) + 'static) {
         let checkfn = StateCheckFn::new(f);
         self.lifecycle(LifeCycle::Internal(InternalLifeCycle::DebugInspectState(
             checkfn,
@@ -253,7 +254,7 @@ impl<T: Data> Harness<'_, T> {
         }
     }
 
-    fn lifecycle(&mut self, event: LifeCycle) {
+    pub(crate) fn lifecycle(&mut self, event: LifeCycle) {
         self.inner.lifecycle(event)
     }
 
@@ -318,7 +319,7 @@ impl<T> Drop for Harness<'_, T> {
         // We need to call finish even if a test assert failed
         if let Err(err) = self.piet.finish() {
             // We can't panic, because we might already be panicking
-            log::error!("piet finish failed: {}", err);
+            tracing::error!("piet finish failed: {}", err);
         }
     }
 }
